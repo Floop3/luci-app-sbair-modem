@@ -72,6 +72,37 @@ var methods = map[string]map[string]any{
 	"wifi_set_protocol":  {"band": "", "protocol": "", "apply": ""},
 	"wifi_apply":         {},
 	"system_reboot":      {},
+	// SIMルータ / 光回線AP化の切替。
+	"netmode_status": {},
+	"netmode_set":    {"mode": ""},
+	// Wi-Fi追加機能(Phase 3)。全て knsh を経由する(wifi_advanced.go参照)。
+	"client_disconnect":   {"mac": ""},
+	"wifi_enabled_status": {},
+	"wifi_enabled_set":    {"enabled": ""},
+	"bandsteering_status": {},
+	"bandsteering_set":    {"enabled": ""},
+	"isolation_status":    {},
+	"isolation_set":       {"kind": "", "enabled": ""},
+	"wifi_11r_status":     {},
+	"wifi_11r_set":        {"enabled": ""},
+	"macfilter_status":    {},
+	"macfilter_mode_set":  {"enabled": ""},
+	"macfilter_add":       {"mac": "", "enabled": ""},
+	"macfilter_delete":    {"mac": ""},
+	"wps_status":          {},
+	"wps_run":             {"band": "", "mode": "", "pin": ""},
+	"wps_pin_random":      {},
+	"wps_reset":           {"band": ""},
+	// 接続機器一覧(有線・無線問わず)。読み取りのみ。
+	"client_list": {},
+	// MACごとの自由メモ。
+	"client_note_set": {"mac": "", "note": ""},
+	// 個別機器への簡易ポートスキャン(オンデマンド)。ports省略時はよく使う
+	// 約25ポートのみ。"1-1024,8080"のような範囲/カンマ区切りを渡すと拡張できる。
+	"client_scan_ports": {"ip": "", "ports": ""},
+	// MAC単位の広告ブロック。SSIDではなくMACで判定する(adblock.go参照)。
+	"adblock_list": {},
+	"adblock_set":  {"mac": "", "enabled": ""},
 }
 
 func cmdRPCD(args []string) int {
@@ -123,6 +154,14 @@ type rpcdArgs struct {
 	Width            string `json:"width"`
 	Protocol         string `json:"protocol"`
 	Apply            string `json:"apply"`
+	MAC              string `json:"mac"`
+	Enabled          string `json:"enabled"`
+	Kind             string `json:"kind"`
+	Pin              string `json:"pin"`
+	Mode             string `json:"mode"`
+	Note             string `json:"note"`
+	IP               string `json:"ip"`
+	Ports            string `json:"ports"`
 }
 
 // rpcdError keeps failures on stdout as JSON. rpcd treats a non-zero exit as
@@ -226,6 +265,79 @@ func rpcdCall(method string) int {
 		return 0
 	case "system_reboot":
 		emit(systemReboot())
+		return 0
+	case "netmode_status":
+		emit(netmodeStatus())
+		return 0
+	case "netmode_set":
+		emit(netmodeSet(in.Mode))
+		return 0
+	case "client_disconnect":
+		emit(clientDisconnect(in.MAC))
+		return 0
+	case "wifi_enabled_status":
+		emit(wifiEnabledStatus())
+		return 0
+	case "wifi_enabled_set":
+		emit(wifiEnabledSet(in.Enabled))
+		return 0
+	case "bandsteering_status":
+		emit(bandsteeringStatus())
+		return 0
+	case "bandsteering_set":
+		emit(bandsteeringSet(in.Enabled))
+		return 0
+	case "isolation_status":
+		emit(isolationStatus())
+		return 0
+	case "isolation_set":
+		emit(isolationSet(in.Kind, in.Enabled))
+		return 0
+	case "wifi_11r_status":
+		emit(dot11rStatus())
+		return 0
+	case "wifi_11r_set":
+		emit(dot11rSet(in.Enabled))
+		return 0
+	case "macfilter_status":
+		emit(macFilterStatus())
+		return 0
+	case "macfilter_mode_set":
+		emit(macFilterModeSet(in.Enabled))
+		return 0
+	case "macfilter_add":
+		emit(macFilterAdd(in.MAC, in.Enabled))
+		return 0
+	case "macfilter_delete":
+		emit(macFilterDelete(in.MAC))
+		return 0
+	case "wps_status":
+		emit(wpsStatus())
+		return 0
+	case "wps_run":
+		emit(wpsRun(in.Band, in.Mode, in.Pin))
+		return 0
+	case "wps_pin_random":
+		emit(wpsPinRandom())
+		return 0
+	case "wps_reset":
+		emit(wpsReset(in.Band))
+		return 0
+	case "client_list":
+		// ip neigh / iwinfo / dhcp.leases しか読まない。AT は不要。
+		emit(clientList())
+		return 0
+	case "client_note_set":
+		emit(clientNoteSet(in.MAC, in.Note))
+		return 0
+	case "client_scan_ports":
+		emit(scanPorts(in.IP, in.Ports))
+		return 0
+	case "adblock_list":
+		emit(adblockList())
+		return 0
+	case "adblock_set":
+		emit(adblockSet(in.MAC, in.Enabled))
 		return 0
 	}
 

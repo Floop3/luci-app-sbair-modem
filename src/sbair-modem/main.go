@@ -83,6 +83,14 @@ func main() {
 		os.Exit(cmdAT(args[1:]))
 	case "rpcd":
 		os.Exit(cmdRPCD(args[1:]))
+	case "adblock-boot":
+		// sbair-adblock initスクリプトから起動時に呼ばれる。hostsファイル書き出し+
+		// iptables反映のみ。専用dnsmasqの起動はinitスクリプト(シェル)側が行う。
+		emit(adblockBoot())
+		return
+	case "portal":
+		// 広告ブロック自己登録ページ(:8090)。procdがフォアグラウンドで監視する。
+		os.Exit(runPortal())
 	case "simmap-worker":
 		// Started detached by simmap_set. Not for people to run by hand.
 		if len(args) < 2 {
@@ -138,6 +146,10 @@ func main() {
 	case "wifi":
 		// uci しか読まない。AT デバイスは開かない。
 		emit(wifiStatus())
+		return
+	case "clients":
+		// ip neigh / iwinfo / dhcp.leases しか読まない。AT デバイスは開かない。
+		emit(clientList())
 		return
 	case "simlock":
 		if len(args) > 1 && (args[1] == "on" || args[1] == "off") {
@@ -323,6 +335,7 @@ func usage() {
   sbair-modem band <LTE> <5G>              enable these bands (e.g. 1,41,42 3,28,77)
                                            reverts itself if the modem stays off-net
   sbair-modem wifi                         Wi-Fi status (read-only, uci wireless as-is)
+  sbair-modem clients                      connected devices, wired+wireless (read-only)
   sbair-modem apn [apply|probe]            APN: show / apply stored / ask the SIM
   sbair-modem boot                         apply everything this SIM needs (boot)
   sbair-modem gc                           reclaim leaked logical channels
