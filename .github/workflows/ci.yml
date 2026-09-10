@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/sbair-modem/go.mod
+
+      - name: Go tests
+        run: go test ./... -count=1
+        working-directory: src/sbair-modem
+
+      - name: Go vet
+        run: go vet ./...
+        working-directory: src/sbair-modem
+
+      - name: Build
+        run: ./build.sh
+
+      - name: Shell and publication fixtures
+        run: |
+          for t in tests/*-fixture.sh; do
+            echo "==> $t"
+            case "$t" in
+              tests/iperf3-parser-fixture.sh|tests/publication-hygiene-fixture.sh)
+                bash "$t"
+                ;;
+              *)
+                sh "$t"
+                ;;
+            esac
+          done
+
+      - name: Check whitespace
+        run: git diff --check

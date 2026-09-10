@@ -227,15 +227,26 @@ func TestSSDPAndPortScanLANBoundaries(t *testing.T) {
 }
 
 func TestAdblockPartialRuleFailureRemovesDNAT(t *testing.T) {
-	oldRun, oldReady, oldMACs, oldIP := adblockIptablesRun, adblockDNSReadyFn, adblockMACsFn, adblockBrlanIPFn
+	oldRun, oldOutput, oldReady, oldMACs, oldIP := adblockIptablesRun, adblockIptablesOutput, adblockDNSReadyFn, adblockMACsFn, adblockBrlanIPFn
 	t.Cleanup(func() {
-		adblockIptablesRun, adblockDNSReadyFn, adblockMACsFn, adblockBrlanIPFn = oldRun, oldReady, oldMACs, oldIP
+		adblockIptablesRun, adblockIptablesOutput, adblockDNSReadyFn, adblockMACsFn, adblockBrlanIPFn = oldRun, oldOutput, oldReady, oldMACs, oldIP
 	})
 	var calls [][]string
+	chainExists, jumpPresent := false, false
 	addCount := 0
 	adblockIptablesRun = func(args ...string) error {
 		calls = append(calls, append([]string(nil), args...))
 		for _, arg := range args {
+			switch arg {
+			case "-N":
+				chainExists = true
+			case "-I":
+				jumpPresent = true
+			case "-D":
+				jumpPresent = false
+			case "-X":
+				chainExists = false
+			}
 			if arg == "-A" {
 				addCount++
 				if addCount == 2 {
@@ -247,6 +258,15 @@ func TestAdblockPartialRuleFailureRemovesDNAT(t *testing.T) {
 			}
 		}
 		return nil
+	}
+	adblockIptablesOutput = func(args ...string) (string, error) {
+		if !chainExists {
+			return "", nil
+		}
+		if jumpPresent {
+			return "-N sbair_adblock\n-A PREROUTING -j sbair_adblock\n", nil
+		}
+		return "-N sbair_adblock\n", nil
 	}
 	adblockDNSReadyFn = func() bool { return true }
 	adblockMACsFn = func() map[string]bool { return map[string]bool{"02:00:00:00:00:01": true} }

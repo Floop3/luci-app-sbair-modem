@@ -123,12 +123,25 @@ UDC、ネットワーク設定、起動時の自動有効化は、通常のア�
 
 確認は [docs/API.md](docs/API.md)。
 
-このリポジトリではGitHub Actionsを使用していないため、検証はローカルfixtureで行います。
-`go test ./...`、`go vet ./...`、`./tests/netmode-fixture.sh`、
-`./tests/wifi-drift-fixture.sh`、`./tests/netdev-fixture.sh`、`./tests/netmode-js-fixture.sh`、
-`./tests/luci-bootstrap-fixture.sh`、`./tests/maintenance-fixture.sh`、
-`./tests/network-diagnostics-js-fixture.sh`、`./tests/ui-structure-fixture.sh`、
-`./tests/usb-js-fixture.sh`、`./tests/usb-nic-fixture.sh`、`./tests/publication-hygiene-fixture.sh`、`./build.sh`が基本的な検証項目です。
+GitHub ActionsのCIは、`src/sbair-modem/go.mod`のGoバージョンを基準に
+`go test ./... -count=1`、`go vet ./...`、`./build.sh`、全fixture、
+`git diff --check`を実行します。ローカルでも同じ検証を再現できます。
+
+```sh
+(cd src/sbair-modem && go test ./... -count=1 && go vet ./...)
+./build.sh
+for t in tests/*-fixture.sh; do
+    echo "==> $t"
+    case "$t" in
+        tests/iperf3-parser-fixture.sh|tests/publication-hygiene-fixture.sh) bash "$t" ;;
+        *) sh "$t" ;;
+    esac
+done
+git diff --check
+```
+
+`iperf3-parser-fixture.sh`と`publication-hygiene-fixture.sh`はBash専用のため、
+実行権限・shebangを使う上記ループ、または`bash "$t"`で実行してください。
 
 ### ネットワーク / LANサービス
 

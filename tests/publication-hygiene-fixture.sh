@@ -85,6 +85,6 @@ done < <(find "$repo" -path "$repo/.git" -prune -o -type f -name '*.md' -print)
 
 # Intentional platform/recovery constants remain allowed and documented.
 rg -q -F '172.16.255.254' "$repo/root/usr/sbin/sbair-netmode" || fail 'platform alias constant disappeared'
-rg -q -F '192.168.3.1' "$repo/root/usr/sbin/sbair-netmode" || fail 'factory/recovery address disappeared'
+rg -q -F '192.168.3.1' "$repo/root/usr/libexec/sbair/netmode/apply.sh" || fail 'factory/recovery address disappeared'
 
 echo '[OK] publication hygiene current-tree checks passed'

@@ -156,6 +156,7 @@ run_netmode() {
 	SBAIR_NETMODE_FALLBACK_FILE="$tmp/fallback" \
 	SBAIR_NETMODE_BRIDGE=br-lan \
 	SBAIR_NETMODE_SELF="$repo/root/usr/sbin/sbair-netmode" \
+	SBAIR_NETMODE_MODULE_DIR="${NETMODE_MODULE_DIR:-$repo/root/usr/libexec/sbair/netmode}" \
 	SBAIR_NETMODE_DNSMASQ_INIT="$fake/dnsmasq-init" \
 	SBAIR_NETMODE_LOCK_DIR="${NETMODE_LOCK_DIR:-}" \
 	UCI_STATE="$state" UCI_FAIL_SET_KEY="${UCI_FAIL_SET_KEY:-}" UCI_FAIL_DELETE_KEY="${UCI_FAIL_DELETE_KEY:-}" UCI_FAIL_COMMIT="${UCI_FAIL_COMMIT:-}" IPTABLES_RULE="$rule" DNSMASQ_LOG="$dnsmasq_log" UDP67_FILE="$udp67_file" ROUTE_DEVICE="${ROUTE_DEVICE:-}" \
@@ -163,6 +164,20 @@ run_netmode() {
 	PATH="$fake:/usr/sbin:/usr/bin:/sbin:/bin" \
 	sh "$repo/root/usr/sbin/sbair-netmode" "$@"
 }
+
+# Modules are resolved from the installed absolute path, not from the caller's
+# working directory. A missing module set must fail before touching UCI state.
+(cd "$tmp" && run_netmode version) | grep -q '^implementation=luci-app-sbair-modem$'
+(cd "$tmp" && run_netmode get-config) >/dev/null
+before_missing_modules=$(shasum -a 256 "$state" | awk '{print $1}')
+if NETMODE_MODULE_DIR="$tmp/missing-modules" run_netmode show >"$tmp/missing-modules.out" 2>&1; then
+	echo 'network-mode ran without its required modules' >&2
+	exit 1
+fi
+after_missing_modules=$(shasum -a 256 "$state" | awk '{print $1}')
+[ "$before_missing_modules" = "$after_missing_modules" ]
+grep -q 'module unavailable' "$tmp/missing-modules.out"
+unset NETMODE_MODULE_DIR
 
 run_firewall() {
 	SBAIR_FIREWALL_PATH="$fake:/usr/sbin:/usr/bin:/sbin:/bin" \
@@ -212,8 +227,8 @@ wait_transaction "$transaction"
 [ "$(state_get network.lan.proto)" = static ]
 [ "$(state_get network.lan.ipaddr)" = 192.168.3.1 ]
 [ "$(state_get dhcp.lan.ignore)" = 0 ]
-grep -q "address=%s" "$repo/root/usr/sbin/sbair-netmode"
-! grep -q "address=192\.168\.3\.1" "$repo/root/usr/sbin/sbair-netmode"
+grep -q "address=%s" "$repo/root/usr/libexec/sbair/netmode/apply.sh"
+! grep -q "address=192\.168\.3\.1" "$repo/root/usr/libexec/sbair/netmode/apply.sh"
 run_netmode rollback >/dev/null
 [ "$(state_get sbair.bridge.managed)" = 0 ]
 [ "$(state_get network.lan.proto)" = dhcp ]
@@ -611,9 +626,9 @@ run_netmode startup >/dev/null
 
 grep -q 'for mark in 0x102 0x202 0x302' "$repo/root/usr/sbin/sbair-netfix"
 grep -q 'SNAPSHOT_KEYS=.*managed' "$repo/root/usr/sbin/sbair-netmode"
-grep -Fq 'if [ "$previous_mode" = ap ] && [ "$previous_managed" = 1 ]; then' "$repo/root/usr/sbin/sbair-netmode"
-grep -Fq 'set_opt network.lan.proto static' "$repo/root/usr/sbin/sbair-netmode"
-grep -Fq 'oem_baseline_ready' "$repo/root/usr/sbin/sbair-netmode"
+grep -Fq 'if [ "$previous_mode" = ap ] && [ "$previous_managed" = 1 ]; then' "$repo/root/usr/libexec/sbair/netmode/state.sh"
+grep -Fq 'set_opt network.lan.proto static' "$repo/root/usr/libexec/sbair/netmode/apply.sh"
+grep -Fq 'oem_baseline_ready' "$repo/root/usr/libexec/sbair/netmode/state.sh"
 
 # A healthy AP DHCP client is automatically confirmed after the target verifies
 # that the new management address is present. This prevents the browser from

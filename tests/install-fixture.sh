@@ -34,6 +34,10 @@ for path in \
 	/usr/sbin/sbair-adblock-dnsmasq \
 	/usr/bin/sbair-modem \
 	/usr/sbin/sbair-netmode \
+	/usr/libexec/sbair/netmode/common.sh \
+	/usr/libexec/sbair/netmode/state.sh \
+	/usr/libexec/sbair/netmode/apply.sh \
+	/usr/libexec/sbair/netmode/status.sh \
 	/usr/sbin/sbair-maintenance \
 	/usr/sbin/sbair-usb-nic \
 	/www/luci-static/resources/view/sbair/lan_services.js \

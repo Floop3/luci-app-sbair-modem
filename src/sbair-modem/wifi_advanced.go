@@ -13,12 +13,17 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
-	"syscall"
 )
 
-func knshOutput(args ...string) (string, error) {
-	out, err := exec.Command("knsh", args...).CombinedOutput()
+type wifiCommandRunner func(name string, args ...string) (string, error)
+
+var wifiCommandRun wifiCommandRunner = func(name string, args ...string) (string, error) {
+	out, err := exec.Command(name, args...).CombinedOutput()
 	return strings.TrimSpace(string(out)), err
+}
+
+func knshOutput(args ...string) (string, error) {
+	return wifiCommandRun("knsh", args...)
 }
 
 // ensureKnosSection は`knos.<section>`が無ければ空のまま作る。
@@ -32,18 +37,92 @@ func knshOutput(args ...string) (string, error) {
 // → 書き込み系を呼ぶ前に必ずこれで下地を作る。中身は空のセクションを
 // 作るだけで、`knos_config`が本来入れる既定値(SSIDテンプレート等)には
 // 一切触れない。
-func ensureKnosSection(section string) {
+func ensureKnosSection(section string) error {
 	if _, err := uci("get", "knos."+section); err != nil {
-		_, _ = uci("set", "knos."+section+"="+section)
-		_, _ = uci("commit", "knos")
+		if _, err := uci("set", "knos."+section+"="+section); err != nil {
+			return fmt.Errorf("uci set knos.%s: %w", section, err)
+		}
+		if err := commitKnos(); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // commitKnos / commitWireless は`knsh`の書き込みコマンドが`uci set`止まりで
 // `commit`を呼ばないことを実機で確認したため、呼び出し側で明示的に行う。
 // (`uci changes knos`に残ったままだと次の再起動で消える。)
-func commitKnos()     { _, _ = uci("commit", "knos") }
-func commitWireless() { _, _ = uci("commit", "wireless") }
+func commitKnos() error {
+	if _, err := uci("commit", "knos"); err != nil {
+		return fmt.Errorf("uci commit knos: %w", err)
+	}
+	return nil
+}
+
+func commitWireless() error {
+	if _, err := uci("commit", "wireless"); err != nil {
+		return fmt.Errorf("uci commit wireless: %w", err)
+	}
+	return nil
+}
+
+func verifyUCIValue(label, path, expected string) error {
+	actual, err := uci("get", path)
+	if err != nil {
+		return fmt.Errorf("%s read-back %s: %w", label, path, err)
+	}
+	if actual != expected {
+		return fmt.Errorf("%s read-back mismatch for %s: expected %q, got %q", label, path, expected, actual)
+	}
+	return nil
+}
+
+func verifyKnshBoolean(label, expected string, args ...string) error {
+	out, err := knshOutput(args...)
+	if err != nil {
+		return fmt.Errorf("%s read-back: %v: %s", label, err, out)
+	}
+	actual := strings.TrimSpace(out)
+	if m := modeDigitRe.FindStringSubmatch(actual); len(m) > 1 {
+		actual = m[1]
+	}
+	if actual != expected {
+		return fmt.Errorf("%s read-back mismatch: expected %q, got %q", label, expected, actual)
+	}
+	return nil
+}
+
+func verifyMacFilterEntry(mac, enabled string) error {
+	raw, err := uci("get", "wireless.rax0.maclist")
+	if err != nil {
+		return fmt.Errorf("mac filter read-back: %w", err)
+	}
+	for _, tok := range strings.Fields(raw) {
+		parts := strings.Split(tok, ",")
+		if len(parts) >= 3 && strings.EqualFold(parts[2], mac) {
+			if parts[1] == enabled {
+				return nil
+			}
+			return fmt.Errorf("mac filter read-back mismatch for %s: expected enabled=%s, got %s", mac, enabled, parts[1])
+		}
+	}
+	return fmt.Errorf("mac filter read-back missing %s", mac)
+}
+
+func verifyMacFilterAbsent(mac string) error {
+	raw, err := uci("get", "wireless.rax0.maclist")
+	if err != nil {
+		// A missing list is the desired state after deleting its last entry.
+		return nil
+	}
+	for _, tok := range strings.Fields(raw) {
+		parts := strings.Split(tok, ",")
+		if len(parts) >= 3 && strings.EqualFold(parts[2], mac) {
+			return fmt.Errorf("mac filter read-back still contains %s", mac)
+		}
+	}
+	return nil
+}
 
 // boolArg は "1"/"true" を書き込み値 "1" に、それ以外を "0" に正規化する。
 func boolArg(v string) string {
@@ -86,13 +165,20 @@ func wifiEnabledStatus() map[string]any {
 }
 
 func wifiEnabledSet(on string) map[string]any {
-	ensureKnosSection("network")
+	if err := ensureKnosSection("network"); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
 	val := boolArg(on)
 	wifiDriftRecord("wifi_enabled_before")
 	if out, err := knshOutput("wlan", "function", "set", val); err != nil {
 		return map[string]any{"error": fmt.Sprintf("knsh wlan function set: %v: %s", err, out)}
 	}
-	commitKnos()
+	if err := commitKnos(); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	if err := verifyUCIValue("wifi enabled", "knos.network.wlan_enabled", val); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
 	wifiDriftRecord("wifi_enabled_after")
 	return map[string]any{"result": "ok", "enabled": val == "1"}
 }
@@ -114,13 +200,20 @@ func bandsteeringStatus() map[string]any {
 }
 
 func bandsteeringSet(on string) map[string]any {
-	ensureKnosSection("network")
+	if err := ensureKnosSection("network"); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
 	val := boolArg(on)
 	wifiDriftRecord("bandsteering_before")
 	if out, err := knshOutput("wlan", "bandsteering", val); err != nil {
 		return map[string]any{"error": fmt.Sprintf("knsh wlan bandsteering: %v: %s", err, out)}
 	}
-	commitKnos()
+	if err := commitKnos(); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	if err := verifyUCIValue("bandsteering", "knos.network.bandsteering", val); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
 	wifiDriftRecord("bandsteering_after")
 	return map[string]any{"result": "ok", "enabled": val == "1"}
 }
@@ -193,26 +286,34 @@ func isolationSet(kind, on string) map[string]any {
 	if !ok {
 		return map[string]any{"error": fmt.Sprintf("unknown isolation kind %q", kind)}
 	}
-	ensureKnosSection("network")
+	if err := ensureKnosSection("network"); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
 	val := boolArg(on)
 	if out, err := knshOutput("wlan", "set", key, val); err != nil {
 		return map[string]any{"error": fmt.Sprintf("knsh wlan set %s: %v: %s", key, err, out)}
 	}
-	commitKnos()
+	if err := commitKnos(); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	if err := verifyUCIValue("isolation", isolationUCIKey[kind], val); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
 
 	// isolate.includeは`ebtables -t nat -F`から全ルールを再構築するため、
 	// `sbair-netfix`が普段取り消し続けているSSID2の有線LAN遮断ルール(§wifi.go
 	// reconcileSSID2LanBlock)も一緒に復活してしまう。常駐デーモンの次周期
 	// (最大15秒)を待たず、ここで直後に同じ後始末を行う。
-	cmd := exec.Command("sh", "-c", "sh /usr/share/knos/isolate.include; "+
-		"mode=\"$(uci -q get dhcp.lan.ignore)\"; "+
-		"if [ \"$mode\" = \"1\" ]; then "+
-		"ebtables -t nat -D postrouting_wlan2lan --mark 0x102 -j DROP 2>/dev/null; "+
-		"ebtables -t nat -D postrouting_wlan2lan --mark 0x202 -j DROP 2>/dev/null; "+
-		"ebtables -t nat -D postrouting_wlan2lan --mark 0x302 -j DROP 2>/dev/null; "+
-		"fi")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	_ = cmd.Start()
+	command := "sh /usr/share/knos/isolate.include; " +
+		"mode=\"$(uci -q get dhcp.lan.ignore)\"; " +
+		"if [ \"$mode\" = \"1\" ]; then " +
+		"ebtables -t nat -D postrouting_wlan2lan --mark 0x102 -j DROP 2>/dev/null; " +
+		"ebtables -t nat -D postrouting_wlan2lan --mark 0x202 -j DROP 2>/dev/null; " +
+		"ebtables -t nat -D postrouting_wlan2lan --mark 0x302 -j DROP 2>/dev/null; " +
+		"fi"
+	if out, err := wifiCommandRun("sh", "-c", command); err != nil {
+		return map[string]any{"error": fmt.Sprintf("isolation runtime apply: %v: %s", err, out)}
+	}
 
 	return map[string]any{"result": "ok", "enabled": val == "1"}
 }
@@ -232,7 +333,12 @@ func dot11rSet(on string) map[string]any {
 	if out, err := knshOutput("wlan", "set", "11r", val); err != nil {
 		return map[string]any{"error": fmt.Sprintf("knsh wlan set 11r: %v: %s", err, out)}
 	}
-	commitWireless()
+	if err := commitWireless(); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	if err := verifyKnshBoolean("11r", val, "wlan", "get", "11r"); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
 	return map[string]any{"result": "ok", "enabled": val == "1"}
 }
 
@@ -286,13 +392,22 @@ func macFilterStatus() map[string]any {
 }
 
 func macFilterModeSet(on string) map[string]any {
-	ensureKnosSection("network")
+	if err := ensureKnosSection("network"); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
 	val := boolArg(on)
 	if out, err := knshOutput("wlan", "filter", "mode", val); err != nil {
 		return map[string]any{"error": fmt.Sprintf("knsh wlan filter mode: %v: %s", err, out)}
 	}
-	commitKnos()
-	commitWireless()
+	if err := commitKnos(); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	if err := commitWireless(); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	if err := verifyKnshBoolean("mac filter mode", val, "wlan", "filter", "mode"); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
 	return map[string]any{"result": "ok", "enabled": val == "1"}
 }
 
@@ -300,13 +415,22 @@ func macFilterAdd(mac, enabled string) map[string]any {
 	if mac == "" {
 		return map[string]any{"error": "mac is required"}
 	}
-	ensureKnosSection("network")
+	if err := ensureKnosSection("network"); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
 	val := boolArg(enabled)
 	if out, err := knshOutput("wlan", "filter", "list", "add", mac, val); err != nil {
 		return map[string]any{"error": fmt.Sprintf("knsh wlan filter list add: %v: %s", err, out)}
 	}
-	commitKnos()
-	commitWireless()
+	if err := commitKnos(); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	if err := commitWireless(); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	if err := verifyMacFilterEntry(mac, val); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
 	return map[string]any{"result": "ok"}
 }
 
@@ -317,8 +441,15 @@ func macFilterDelete(mac string) map[string]any {
 	if out, err := knshOutput("wlan", "filter", "list", "delete", mac); err != nil {
 		return map[string]any{"error": fmt.Sprintf("knsh wlan filter list delete: %v: %s", err, out)}
 	}
-	commitKnos()
-	commitWireless()
+	if err := commitKnos(); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	if err := commitWireless(); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	if err := verifyMacFilterAbsent(mac); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
 	return map[string]any{"result": "ok"}
 }
 

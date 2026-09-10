@@ -12,125 +12,153 @@ import (
 
 // rpcd exec backend for the ubus object "sbair".
 
-// methods is the table handed to rpcd.
+// rpcRegistry is the single source for the method schema and its ACL class.
 //
 // **rpcd reads each argument's type from the type of the sample value**, not
 // from a type name: `{"mapping": 0}` declares an integer, whereas
 // `{"mapping": "int"}` would declare a string and make rpcd reject
 // `{"mapping": 1}` before this program ever runs. So the values here are
 // zero values of the intended type, not names.
-var methods = map[string]map[string]any{
-	"overview":      {},
-	"esim_status":   {},
-	"esim_list":     {},
-	"esim_enable":   {"iccid": ""},
-	"esim_disable":  {"iccid": ""},
-	"esim_delete":   {"iccid": ""},
-	"esim_nickname": {"iccid": "", "nickname": ""},
-	"simmap_get":    {},
-	"simmap_set":    {"mapping": 0},
-	"simmap_status": {},
+type rpcAccess string
+
+const (
+	rpcRead  rpcAccess = "read"
+	rpcWrite rpcAccess = "write"
+)
+
+type rpcMethodSpec struct {
+	Args   map[string]any
+	Access rpcAccess
+}
+
+func rpcReadSpec(args map[string]any) rpcMethodSpec {
+	return rpcMethodSpec{Args: args, Access: rpcRead}
+}
+
+func rpcWriteSpec(args map[string]any) rpcMethodSpec {
+	return rpcMethodSpec{Args: args, Access: rpcWrite}
+}
+
+var rpcRegistry = map[string]rpcMethodSpec{
+	"overview":      rpcReadSpec(map[string]any{}),
+	"esim_status":   rpcReadSpec(map[string]any{}),
+	"esim_list":     rpcReadSpec(map[string]any{}),
+	"esim_enable":   rpcWriteSpec(map[string]any{"iccid": ""}),
+	"esim_disable":  rpcWriteSpec(map[string]any{"iccid": ""}),
+	"esim_delete":   rpcWriteSpec(map[string]any{"iccid": ""}),
+	"esim_nickname": rpcWriteSpec(map[string]any{"iccid": "", "nickname": ""}),
+	"simmap_get":    rpcReadSpec(map[string]any{}),
+	"simmap_set":    rpcWriteSpec(map[string]any{"mapping": 0}),
+	"simmap_status": rpcReadSpec(map[string]any{}),
 	// eSIM のインストール (ES9+)。20〜30 秒かかるので非同期。
-	"esim_download":        {"activation_code": "", "confirmation_code": ""},
-	"esim_download_status": {},
+	"esim_download":        rpcWriteSpec(map[string]any{"activation_code": "", "confirmation_code": ""}),
+	"esim_download_status": rpcReadSpec(map[string]any{}),
 	// SIM ロック(ネットワークロック)。切替は CFUN の往復が要るので非同期。
-	"simlock_get":    {},
-	"simlock_set":    {"on": false},
-	"simlock_status": {},
+	"simlock_get":    rpcReadSpec(map[string]any{}),
+	"simlock_set":    rpcWriteSpec(map[string]any{"on": false}),
+	"simlock_status": rpcReadSpec(map[string]any{}),
 	// APN。ICCID をキーに /etc/config/sbair へ保存する。
-	"apn_status": {},
-	"apn_set": {"iccid": "", "apn": "", "auth": "", "username": "",
-		"password": "", "iptype": "", "label": "", "unlock": "", "ims": ""},
-	"apn_delete": {"iccid": ""},
-	"apn_apply":  {},
-	"apn_probe":  {},
+	"apn_status": rpcReadSpec(map[string]any{}),
+	"apn_set": rpcWriteSpec(map[string]any{"iccid": "", "apn": "", "auth": "", "username": "",
+		"password": "", "iptype": "", "label": "", "unlock": "", "ims": ""}),
+	"apn_delete": rpcWriteSpec(map[string]any{"iccid": ""}),
+	"apn_apply":  rpcWriteSpec(map[string]any{}),
+	"apn_probe":  rpcReadSpec(map[string]any{}),
 	// モデムのリセット (AT+CFUN=0 → 1 → ifup wan)。30〜60 秒かかるので非同期。
-	"modem_reset":        {},
-	"modem_reset_status": {},
+	"modem_reset":        rpcWriteSpec(map[string]any{}),
+	"modem_reset_status": rpcReadSpec(map[string]any{}),
 	// SMS。受信のみ。sms_status は本文を読まないので未読を既読にしない。
-	"sms_list":     {},
-	"sms_status":   {},
-	"sms_import":   {},
-	"sms_sims":     {},
-	"sms_messages": {"iccid": "", "limit": 0},
+	"sms_list":     rpcReadSpec(map[string]any{}),
+	"sms_status":   rpcReadSpec(map[string]any{}),
+	"sms_import":   rpcWriteSpec(map[string]any{}),
+	"sms_sims":     rpcReadSpec(map[string]any{}),
+	"sms_messages": rpcReadSpec(map[string]any{"iccid": "", "limit": 0}),
 	// IMS。出荷状態では Off。SMS は IMS 経由で配送される。
-	"ims_status": {},
-	"ims_set":    {"on": false},
+	"ims_status": rpcReadSpec(map[string]any{}),
+	"ims_set":    rpcWriteSpec(map[string]any{"on": false}),
 	// バンド。読みは overview の band に入る。変更は数秒ネットワークから切れるので非同期。
-	"band_set":    {"lte": "", "nr": ""},
-	"band_status": {},
+	"band_set":    rpcWriteSpec(map[string]any{"lte": "", "nr": ""}),
+	"band_status": rpcReadSpec(map[string]any{}),
 	// 削除は保管庫とモデムの両方から消す。**取り消せない。**
-	"sms_delete": {"hash": ""},
-	"sms_purge":  {"iccid": ""},
+	"sms_delete": rpcWriteSpec(map[string]any{"hash": ""}),
+	"sms_purge":  rpcWriteSpec(map[string]any{"iccid": ""}),
 	// Wi-Fi。読み取りは uci の wireless をそのまま見せる。
-	"wifi_status": {},
+	"wifi_status": rpcReadSpec(map[string]any{}),
 	// Wi-Fi書き込み。LuCI画面の複数変更は一括RPCで検証・保存・反映する。
-	"wifi_set_channel":     {"band": "", "channel": "", "apply": ""},
-	"wifi_set_bandwidth":   {"band": "", "width": "", "apply": ""},
-	"wifi_set_protocol":    {"band": "", "protocol": "", "apply": ""},
-	"wifi_apply":           {},
-	"wifi_apply_batch":     {"changes": ""},
-	"wifi_txpower_max":     {},
-	"wifi_txpower_default": {},
+	"wifi_set_channel":     rpcWriteSpec(map[string]any{"band": "", "channel": "", "apply": ""}),
+	"wifi_set_bandwidth":   rpcWriteSpec(map[string]any{"band": "", "width": "", "apply": ""}),
+	"wifi_set_protocol":    rpcWriteSpec(map[string]any{"band": "", "protocol": "", "apply": ""}),
+	"wifi_apply":           rpcWriteSpec(map[string]any{}),
+	"wifi_apply_batch":     rpcWriteSpec(map[string]any{"changes": ""}),
+	"wifi_txpower_max":     rpcWriteSpec(map[string]any{}),
+	"wifi_txpower_default": rpcWriteSpec(map[string]any{}),
 	// Wi-Fi drift monitor: normal operation is read-only; the save/restart
 	// diagnostics are separate explicit actions.
-	"wifi_drift_status":       {},
-	"wifi_drift_logs":         {},
-	"wifi_drift_set":          {"enabled": ""},
-	"wifi_drift_mark_good":    {},
-	"wifi_drift_save_test":    {},
-	"wifi_drift_restart_test": {},
-	"system_reboot":           {},
+	"wifi_drift_status":       rpcReadSpec(map[string]any{}),
+	"wifi_drift_logs":         rpcReadSpec(map[string]any{}),
+	"wifi_drift_set":          rpcWriteSpec(map[string]any{"enabled": ""}),
+	"wifi_drift_mark_good":    rpcWriteSpec(map[string]any{}),
+	"wifi_drift_save_test":    rpcWriteSpec(map[string]any{}),
+	"wifi_drift_restart_test": rpcWriteSpec(map[string]any{}),
+	"system_reboot":           rpcWriteSpec(map[string]any{}),
 	// SIMルータ / 光回線AP化の切替。
-	"netmode_status":        {},
-	"netmode_netdev_status": {},
-	"netmode_get_config":    {},
-	"netmode_set_config":    {"proto": "", "ipaddr": "", "netmask": "", "gateway": "", "dns": "", "fallback_enabled": false, "fallback_ip": "", "fallback_netmask": "", "fallback_timeout": 0, "dhcp_start_ip": "", "dhcp_end_ip": "", "dhcp_leasetime": ""},
-	"netmode_set":           {"mode": ""},
-	"netmode_apply":         {"mode": "", "proto": "", "ipaddr": "", "netmask": "", "gateway": "", "dns": "", "fallback_enabled": false, "fallback_ip": "", "fallback_netmask": "", "fallback_timeout": 0, "dhcp_start_ip": "", "dhcp_end_ip": "", "dhcp_leasetime": ""},
-	"netmode_confirm":       {},
-	"netmode_rollback":      {},
-	"netmode_unmanage":      {},
-	"netmode_repair":        {},
+	"netmode_status":        rpcReadSpec(map[string]any{}),
+	"netmode_netdev_status": rpcReadSpec(map[string]any{}),
+	"netmode_get_config":    rpcReadSpec(map[string]any{}),
+	"netmode_set_config":    rpcWriteSpec(map[string]any{"proto": "", "ipaddr": "", "netmask": "", "gateway": "", "dns": "", "fallback_enabled": false, "fallback_ip": "", "fallback_netmask": "", "fallback_timeout": 0, "dhcp_start_ip": "", "dhcp_end_ip": "", "dhcp_leasetime": ""}),
+	"netmode_set":           rpcWriteSpec(map[string]any{"mode": ""}),
+	"netmode_apply":         rpcWriteSpec(map[string]any{"mode": "", "proto": "", "ipaddr": "", "netmask": "", "gateway": "", "dns": "", "fallback_enabled": false, "fallback_ip": "", "fallback_netmask": "", "fallback_timeout": 0, "dhcp_start_ip": "", "dhcp_end_ip": "", "dhcp_leasetime": ""}),
+	"netmode_confirm":       rpcWriteSpec(map[string]any{}),
+	"netmode_rollback":      rpcWriteSpec(map[string]any{}),
+	"netmode_unmanage":      rpcWriteSpec(map[string]any{}),
+	"netmode_repair":        rpcWriteSpec(map[string]any{}),
 	// Device maintenance. These methods are deliberately separate from the
 	// connection-mode DHCP client controls.
-	"maintenance_status": {},
-	"dhcp_server_set":    {"enabled": false},
-	"fota_set":           {"enabled": false},
+	"maintenance_status": rpcReadSpec(map[string]any{}),
+	"dhcp_server_set":    rpcWriteSpec(map[string]any{"enabled": false}),
+	"fota_set":           rpcWriteSpec(map[string]any{"enabled": false}),
 	// USB host inventory is read-only. The USB gadget controls below are a
 	// separate optional, explicit, high-risk feature.
-	"usb_status":      {},
-	"usb_nic_status":  {},
-	"usb_nic_enable":  {"ack": false},
-	"usb_nic_disable": {},
+	"usb_status":      rpcReadSpec(map[string]any{}),
+	"usb_nic_status":  rpcReadSpec(map[string]any{}),
+	"usb_nic_enable":  rpcWriteSpec(map[string]any{"ack": false}),
+	"usb_nic_disable": rpcWriteSpec(map[string]any{}),
 	// Wi-Fi追加機能(Phase 3)。全て knsh を経由する(wifi_advanced.go参照)。
-	"client_disconnect":   {"mac": ""},
-	"wifi_enabled_status": {},
-	"wifi_enabled_set":    {"enabled": ""},
-	"bandsteering_status": {},
-	"bandsteering_set":    {"enabled": ""},
-	"isolation_status":    {},
-	"isolation_set":       {"kind": "", "enabled": ""},
-	"wifi_11r_status":     {},
-	"wifi_11r_set":        {"enabled": ""},
-	"macfilter_status":    {},
-	"macfilter_mode_set":  {"enabled": ""},
-	"macfilter_add":       {"mac": "", "enabled": ""},
-	"macfilter_delete":    {"mac": ""},
-	"wps_status":          {},
-	"wps_run":             {"band": "", "mode": "", "pin": ""},
-	"wps_pin_random":      {},
-	"wps_reset":           {"band": ""},
+	"client_disconnect":   rpcWriteSpec(map[string]any{"mac": ""}),
+	"wifi_enabled_status": rpcReadSpec(map[string]any{}),
+	"wifi_enabled_set":    rpcWriteSpec(map[string]any{"enabled": ""}),
+	"bandsteering_status": rpcReadSpec(map[string]any{}),
+	"bandsteering_set":    rpcWriteSpec(map[string]any{"enabled": ""}),
+	"isolation_status":    rpcReadSpec(map[string]any{}),
+	"isolation_set":       rpcWriteSpec(map[string]any{"kind": "", "enabled": ""}),
+	"wifi_11r_status":     rpcReadSpec(map[string]any{}),
+	"wifi_11r_set":        rpcWriteSpec(map[string]any{"enabled": ""}),
+	"macfilter_status":    rpcReadSpec(map[string]any{}),
+	"macfilter_mode_set":  rpcWriteSpec(map[string]any{"enabled": ""}),
+	"macfilter_add":       rpcWriteSpec(map[string]any{"mac": "", "enabled": ""}),
+	"macfilter_delete":    rpcWriteSpec(map[string]any{"mac": ""}),
+	"wps_status":          rpcReadSpec(map[string]any{}),
+	"wps_run":             rpcWriteSpec(map[string]any{"band": "", "mode": "", "pin": ""}),
+	"wps_pin_random":      rpcWriteSpec(map[string]any{}),
+	"wps_reset":           rpcWriteSpec(map[string]any{"band": ""}),
 	// 接続機器一覧(有線・無線問わず)。読み取りのみ。
-	"client_list": {},
+	"client_list": rpcReadSpec(map[string]any{}),
 	// MACごとの自由メモ。
-	"client_note_set": {"mac": "", "note": ""},
+	"client_note_set": rpcWriteSpec(map[string]any{"mac": "", "note": ""}),
 	// 個別機器への簡易ポートスキャン(オンデマンド)。ports省略時はよく使う
 	// 約25ポートのみ。"1-1024,8080"のような範囲/カンマ区切りを渡すと拡張できる。
-	"client_scan_ports": {"ip": "", "ports": ""},
+	"client_scan_ports": rpcWriteSpec(map[string]any{"ip": "", "ports": ""}),
 	// MAC単位の広告ブロック。SSIDではなくMACで判定する(adblock.go参照)。
-	"adblock_list": {},
-	"adblock_set":  {"mac": "", "enabled": ""},
+	"adblock_list": rpcReadSpec(map[string]any{}),
+	"adblock_set":  rpcWriteSpec(map[string]any{"mac": "", "enabled": ""}),
+}
+
+func rpcMethodSchemas() map[string]map[string]any {
+	out := make(map[string]map[string]any, len(rpcRegistry))
+	for name, spec := range rpcRegistry {
+		out[name] = spec.Args
+	}
+	return out
 }
 
 func cmdRPCD(args []string) int {
@@ -140,7 +168,7 @@ func cmdRPCD(args []string) int {
 	}
 	switch args[0] {
 	case "list":
-		emit(methods)
+		emit(rpcMethodSchemas())
 		return 0
 	case "call":
 		if len(args) < 2 {
@@ -241,7 +269,7 @@ func rpcdError(format string, a ...any) int {
 }
 
 func rpcdCall(method string) int {
-	if _, ok := methods[method]; !ok {
+	if _, ok := rpcRegistry[method]; !ok {
 		return rpcdError("unknown method %q", method)
 	}
 

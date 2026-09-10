@@ -128,6 +128,7 @@ check_netmode_ownership
 
 mkdir -p "$ROOT/usr/bin" \
          "$ROOT/usr/sbin" \
+         "$ROOT/usr/libexec/sbair/netmode" \
          "$ROOT/usr/libexec/rpcd" \
          "$ROOT/usr/share/rpcd/acl.d" \
          "$ROOT/usr/share/luci/menu.d" \
@@ -147,6 +148,10 @@ put() {   # put <src> <dst> <mode>
 
 put "$SELF/out/sbair-modem"             "$ROOT/usr/bin/sbair-modem"          0755
 put "$SELF/root/usr/sbin/sbair-netmode" "$ROOT/usr/sbin/sbair-netmode"       0755
+for module in common.sh state.sh apply.sh status.sh; do
+	put "$SELF/root/usr/libexec/sbair/netmode/$module" \
+	    "$ROOT/usr/libexec/sbair/netmode/$module" 0755
+done
 put "$SELF/root/usr/sbin/sbair-maintenance" "$ROOT/usr/sbin/sbair-maintenance" 0755
 put "$SELF/root/usr/sbin/sbair-usb-nic" "$ROOT/usr/sbin/sbair-usb-nic" 0755
 put "$SELF/root/usr/sbin/sbair-netfix"  "$ROOT/usr/sbin/sbair-netfix"        0755
