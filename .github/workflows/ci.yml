@@ -18,6 +18,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: src/sbair-modem/go.mod
+          cache: false
 
       - name: Go tests
         run: go test ./... -count=1
@@ -29,6 +30,11 @@ jobs:
 
       - name: Build
         run: ./build.sh
+
+      - name: Install fixture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ripgrep
 
       - name: Shell and publication fixtures
         run: |
