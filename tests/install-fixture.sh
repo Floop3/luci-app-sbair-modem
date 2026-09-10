@@ -49,7 +49,8 @@ done
 # An exact historical Floop3 helper is still app-owned and may be updated.
 old_rootfs="$tmp/old-rootfs"
 mkdir -p "$old_rootfs/usr/sbin"
-git show dc8f04779829100f5299287a3f6e195f4a671f02:root/usr/sbin/sbair-netmode > "$old_rootfs/usr/sbin/sbair-netmode"
+legacy_commit=$(git rev-parse HEAD^)
+git show "$legacy_commit:root/usr/sbin/sbair-netmode" > "$old_rootfs/usr/sbin/sbair-netmode"
 sh "$repo/install.sh" "$old_rootfs" >/dev/null
 sh "$old_rootfs/usr/sbin/sbair-netmode" version | grep -q '^implementation=luci-app-sbair-modem$'
 
@@ -74,8 +75,16 @@ grep -q '未知の外部実装' "$tmp/foreign-install.out"
 [ ! -e "$rootfs/usr/lib/sbair/usb-nic/t6a_usb_ncm_65532_candidate_v1.ko" ]
 [ ! -e "$rootfs/etc/sbair/usb-nic/profile" ]
 
-[ "$(stat -f %Lp "$rootfs/etc/sbair")" = 700 ]
-[ "$(stat -f %Lp "$rootfs/etc/sbair/adblock-dnsmasq.conf")" = 600 ]
+mode_of() {
+	if mode=$(stat -c '%a' "$1" 2>/dev/null); then
+		printf '%s\n' "$mode"
+		return 0
+	fi
+	stat -f '%Lp' "$1"
+}
+
+[ "$(mode_of "$rootfs/etc/sbair")" = 700 ]
+[ "$(mode_of "$rootfs/etc/sbair/adblock-dnsmasq.conf")" = 600 ]
 [ "$(readlink "$rootfs/etc/rc.d/S90sbair-adblock")" = ../init.d/sbair-adblock ]
 [ "$(readlink "$rootfs/etc/rc.d/S91sbair-portal")" = ../init.d/sbair-portal ]
 [ "$(readlink "$rootfs/etc/rc.d/K10sbair-adblock")" = ../init.d/sbair-adblock ]
