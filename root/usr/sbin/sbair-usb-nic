@@ -1,0 +1,637 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Floop3
+#
+# Optional SBA6 USB CDC-NCM gadget controller. This is deliberately the only
+# place that can mutate the app-owned ConfigFS gadget or bind the UDC.
+set -u
+
+PATH=${SBAIR_USB_NIC_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+export PATH
+
+BUNDLE_DIR=${SBAIR_USB_NIC_BUNDLE_DIR:-/usr/lib/sbair/usb-nic}
+STATE_DIR=${SBAIR_USB_NIC_STATE_DIR:-/etc/sbair/usb-nic}
+PROFILE=${SBAIR_USB_NIC_PROFILE:-/etc/sbair/usb-nic/profile}
+GADGET_ROOT=${SBAIR_USB_NIC_GADGET_ROOT:-/config/usb_gadget}
+UDC_ROOT=${SBAIR_USB_NIC_UDC_ROOT:-/sys/class/udc}
+NET_ROOT=${SBAIR_USB_NIC_NET_ROOT:-/sys/class/net}
+SYS_MODULE_ROOT=${SBAIR_USB_NIC_SYS_MODULE_ROOT:-/sys/module}
+PROC_MODULES=${SBAIR_USB_NIC_PROC_MODULES:-/proc/modules}
+RELEASE_FILE=${SBAIR_USB_NIC_RELEASE_FILE:-/etc/openwrt_release}
+
+MODULE_FILE=t6a_usb_ncm_65532_candidate_v1.ko
+MODULE_NAME=t6a_usb_ncm_65532_candidate_v1
+EXPECTED_SHA256=7f0e5f3ec197a5f80f23195a3945a2d700bca9d97b8c04eadbacb02c247523c1
+EXPECTED_VERMAGIC='5.4.238 SMP mod_unload modversions aarch64'
+EXPECTED_RELEASE=21.02.7
+EXPECTED_TARGET=gem6xxx/evb6990_cpe_mt7990_emmc
+EXPECTED_VENDOR_ARCH=aarch64_cortex-a55_neon-vfpv4
+EXPECTED_MACHINE=aarch64
+EXPECTED_KERNEL=5.4.238
+GADGET_NAME=t6a_ncm_test
+FUNCTION_NAME=t6a_ncm.test0
+CONFIG_NAME=c.1
+UDC_NAME=11201000.usb
+NET_NAME=usb0
+
+MODULE_PATH=$BUNDLE_DIR/$MODULE_FILE
+BUNDLE_LOCK=$BUNDLE_DIR/driver.lock
+CUSTOM_GADGET=$GADGET_ROOT/$GADGET_NAME
+CUSTOM_FUNCTION=$CUSTOM_GADGET/functions/$FUNCTION_NAME
+CUSTOM_CONFIG=$CUSTOM_GADGET/configs/$CONFIG_NAME
+CUSTOM_LINK=$CUSTOM_CONFIG/$FUNCTION_NAME
+
+PREFLIGHT_OK=1
+PREFLIGHT_REASON=ok
+MODULE_REASON=ok
+PROFILE_REASON=ok
+SNAPSHOT_PATH=
+USB0_ADDRESS_ADDED=0
+
+die() {
+	printf 'result=error\nerror=%s\n' "$1"
+	exit 1
+}
+
+read_one() {
+	file=$1
+	if [ "$#" -ge 2 ]; then default=$2; else default=unknown; fi
+	if [ -r "$file" ]; then
+		line=
+		IFS= read -r line < "$file" || true
+		[ -n "$line" ] && printf '%s\n' "$line" || printf '%s\n' "$default"
+	else
+		printf '%s\n' "$default"
+	fi
+}
+
+release_value() {
+	line=$(grep -m 1 "^$1=" "$RELEASE_FILE" 2>/dev/null || true)
+	printf '%s\n' "$line" | sed "s/^$1='//; s/'$//"
+}
+
+stat_mode() {
+	stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null
+}
+
+stat_owner() {
+	stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null
+}
+
+private_path() {
+	path=$1
+	[ ! -L "$path" ] || return 1
+	if [ -e "$path" ]; then
+		[ -f "$path" ] || [ -d "$path" ] || return 1
+	fi
+	return 0
+}
+
+private_dir() {
+	dir=$1
+	private_path "$dir" || return 1
+	[ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || return 1
+	chmod 700 "$dir" 2>/dev/null || return 1
+	mode=$(stat_mode "$dir" 2>/dev/null || true)
+	case "$mode" in 700|0700) ;; *) return 1 ;; esac
+	owner=$(stat_owner "$dir" 2>/dev/null || true)
+	uid=$(id -u 2>/dev/null || printf '0')
+	[ "$owner" = 0 ] || [ "$owner" = "$uid" ] || return 1
+}
+
+private_file() {
+	file=$1
+	[ -f "$file" ] || return 1
+	[ ! -L "$file" ] || return 1
+	mode=$(stat_mode "$file" 2>/dev/null || true)
+	case "$mode" in 600|0600) ;; *) return 1 ;; esac
+	owner=$(stat_owner "$file" 2>/dev/null || true)
+	uid=$(id -u 2>/dev/null || printf '0')
+	[ "$owner" = 0 ] || [ "$owner" = "$uid" ] || return 1
+}
+
+profile_get() {
+	sed -n "s/^$1=//p" "$PROFILE" 2>/dev/null | head -n 1
+}
+
+hex4() {
+	printf '%s\n' "$1" | awk 'length($0) == 4 && $0 ~ /^[0-9A-Fa-f]+$/ { ok=1 } END { exit(ok ? 0 : 1) }'
+}
+
+mac_valid() {
+	printf '%s\n' "$1" | awk -F: '
+		NF == 6 { ok=1; for (i=1; i<=6; i++) if (length($i) != 2 || $i !~ /^[0-9A-Fa-f]+$/) ok=0 }
+		END { exit(ok ? 0 : 1) }'
+}
+
+ipv4_valid() {
+	printf '%s\n' "$1" | awk -F. '
+		NF == 4 { ok=1; for (i=1; i<=4; i++) if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) ok=0 }
+		END { exit(ok ? 0 : 1) }'
+}
+
+cidr_valid() {
+	value=$1
+	ip=${value%/*}
+	prefix=${value#*/}
+	[ "$ip" != "$value" ] || return 1
+	ipv4_valid "$ip" || return 1
+	printf '%s\n' "$prefix" | awk '/^[0-9]+$/ && $0 >= 0 && $0 <= 32 { ok=1 } END { exit(ok ? 0 : 1) }'
+}
+
+profile_valid() {
+	PROFILE_REASON=ok
+	if [ ! -f "$PROFILE" ] || [ -L "$PROFILE" ]; then
+		PROFILE_REASON=missing
+		return 1
+	fi
+	if ! private_file "$PROFILE"; then
+		PROFILE_REASON=profile-must-be-root-owned-mode-600
+		return 1
+	fi
+	if ! awk -F= '
+		BEGIN {
+			allowed["VID_HEX"]=1; allowed["PID_HEX"]=1; allowed["DEV_MAC"]=1
+			allowed["HOST_MAC"]=1; allowed["USB0_ADDR"]=1; allowed["PEER_IPV4"]=1
+			req[1]="VID_HEX"; req[2]="PID_HEX"; req[3]="DEV_MAC"
+			req[4]="HOST_MAC"; req[5]="USB0_ADDR"; req[6]="PEER_IPV4"
+		}
+		/^[[:space:]]*$/ || /^[[:space:]]*#/ { next }
+		NF != 2 || $1 !~ /^[A-Z][A-Z0-9_]*$/ || !allowed[$1] || $2 == "" { bad=1; next }
+		{ if (++seen[$1] > 1) bad=1 }
+		END { for (i=1; i<=6; i++) if (!seen[req[i]]) bad=1; exit(bad ? 1 : 0) }
+	' "$PROFILE"; then
+		PROFILE_REASON=required-fields-or-duplicates-invalid
+		return 1
+	fi
+	VID_HEX=$(profile_get VID_HEX)
+	PID_HEX=$(profile_get PID_HEX)
+	DEV_MAC=$(profile_get DEV_MAC)
+	HOST_MAC=$(profile_get HOST_MAC)
+	USB0_ADDR=$(profile_get USB0_ADDR)
+	PEER_IPV4=$(profile_get PEER_IPV4)
+	hex4 "$VID_HEX" || { PROFILE_REASON=VID_HEX-invalid; return 1; }
+	hex4 "$PID_HEX" || { PROFILE_REASON=PID_HEX-invalid; return 1; }
+	mac_valid "$DEV_MAC" || { PROFILE_REASON=DEV_MAC-invalid; return 1; }
+	mac_valid "$HOST_MAC" || { PROFILE_REASON=HOST_MAC-invalid; return 1; }
+	cidr_valid "$USB0_ADDR" || { PROFILE_REASON=USB0_ADDR-invalid; return 1; }
+	ipv4_valid "$PEER_IPV4" || { PROFILE_REASON=PEER_IPV4-invalid; return 1; }
+	return 0
+}
+
+module_valid() {
+	MODULE_REASON=ok
+	if [ ! -f "$MODULE_PATH" ] || [ -L "$MODULE_PATH" ]; then
+		MODULE_REASON=missing
+		return 1
+	fi
+	bundle_lock_valid || { MODULE_REASON=lock-mismatch; return 1; }
+	command -v sha256sum >/dev/null 2>&1 || { MODULE_REASON=sha256sum-missing; return 1; }
+	actual=$(sha256sum "$MODULE_PATH" 2>/dev/null | awk '{print $1}')
+	[ "$actual" = "$EXPECTED_SHA256" ] || { MODULE_REASON=sha256-mismatch; return 1; }
+	if command -v modinfo >/dev/null 2>&1; then
+		actual_vm=$(modinfo -F vermagic "$MODULE_PATH" 2>/dev/null || true)
+	elif command -v strings >/dev/null 2>&1; then
+		actual_vm=$(strings "$MODULE_PATH" 2>/dev/null | grep -F -m 1 "$EXPECTED_VERMAGIC" || true)
+	else
+		MODULE_REASON=vermagic-tool-missing
+		return 1
+	fi
+	[ "$actual_vm" = "$EXPECTED_VERMAGIC" ] || { MODULE_REASON=vermagic-mismatch; return 1; }
+	return 0
+}
+
+module_loaded() {
+	[ -d "$SYS_MODULE_ROOT/$MODULE_NAME" ] && return 0
+	[ -r "$PROC_MODULES" ] || return 1
+	awk -v n="$MODULE_NAME" '$1 == n { found=1 } END { exit(found ? 0 : 1) }' "$PROC_MODULES"
+}
+
+module_loaded_value() {
+	if module_loaded; then printf '1\n'; else printf '0\n'; fi
+}
+
+loaded_usb_modules() {
+	if [ ! -r "$PROC_MODULES" ]; then
+		printf 'unknown\n'
+		return
+	fi
+	value=$(awk '$1 ~ /(usb|ncm|gadget|udc)/ { if (out != "") out = out ","; out = out $1 } END { print (out == "" ? "none" : out) }' "$PROC_MODULES")
+	printf '%s\n' "$value"
+}
+
+bundle_lock_valid() {
+	private_file "$BUNDLE_LOCK" || return 1
+	grep -Fqx "ARTIFACT_FILENAME=$MODULE_FILE" "$BUNDLE_LOCK" || return 1
+	grep -Fqx "MODULE_NAME=$MODULE_NAME" "$BUNDLE_LOCK" || return 1
+	grep -Fqx "SHA256=$EXPECTED_SHA256" "$BUNDLE_LOCK" || return 1
+	grep -Fqx "VERMAGIC=$EXPECTED_VERMAGIC" "$BUNDLE_LOCK" || return 1
+	grep -Fqx 'UPSTREAM_REVISION=97f55791dd0de4161cb2a9bd06ab9799ff580a8d' "$BUNDLE_LOCK" || return 1
+}
+
+bundle_state() {
+	if [ ! -f "$MODULE_PATH" ]; then
+		MODULE_REASON=missing
+		printf 'missing\n'
+	elif module_valid >/dev/null 2>&1; then
+		printf 'installed\n'
+	else
+		printf 'invalid-hash\n'
+	fi
+}
+
+udc_value() { read_one "$1/UDC" ''; }
+
+bound_gadget() {
+	for gadget in "$GADGET_ROOT"/*; do
+		[ -d "$gadget" ] || continue
+		value=$(udc_value "$gadget")
+		[ -n "$value" ] && { basename "$gadget"; return 0; }
+	done
+	printf '%s\n' none
+}
+
+usb0_state() {
+	if [ ! -d "$NET_ROOT/$NET_NAME" ]; then
+		printf 'absent\n'
+		return
+	fi
+	read_one "$NET_ROOT/$NET_NAME/operstate" unknown
+}
+
+usb0_carrier() {
+	if [ ! -d "$NET_ROOT/$NET_NAME" ]; then printf 'absent\n'; else read_one "$NET_ROOT/$NET_NAME/carrier" unknown; fi
+}
+
+management_path_state() {
+	command -v ip >/dev/null 2>&1 || { printf 'ng\n'; return; }
+	[ -d "$NET_ROOT/br-lan" ] || { printf 'ng\n'; return; }
+	ip -4 addr show br-lan 2>/dev/null | grep -q '[[:space:]]inet[[:space:]]' && printf 'ok\n' || printf 'ng\n'
+}
+
+preflight_fail() {
+	[ "$PREFLIGHT_OK" -eq 1 ] || return 0
+	PREFLIGHT_OK=0
+	PREFLIGHT_REASON=$1
+}
+
+preflight_check() {
+	PREFLIGHT_OK=1
+	PREFLIGHT_REASON=ok
+	[ -d "$GADGET_ROOT" ] || preflight_fail configfs-missing
+	[ -d "$UDC_ROOT/$UDC_NAME" ] || preflight_fail udc-missing
+	[ -r "$UDC_ROOT/$UDC_NAME/state" ] || preflight_fail udc-state-missing
+	[ -r "$UDC_ROOT/$UDC_NAME/current_speed" ] || preflight_fail udc-speed-missing
+	command -v find >/dev/null 2>&1 || preflight_fail find-missing
+	find "$GADGET_ROOT" -maxdepth 4 -print >/dev/null 2>&1 || preflight_fail configfs-read-failed
+	[ "$(release_value DISTRIB_RELEASE)" = "$EXPECTED_RELEASE" ] || preflight_fail unsupported-release
+	[ "$(release_value DISTRIB_TARGET)" = "$EXPECTED_TARGET" ] || preflight_fail unsupported-target
+	[ "$(release_value DISTRIB_ARCH)" = "$EXPECTED_VENDOR_ARCH" ] || preflight_fail unsupported-vendor-architecture
+	[ "$(uname -r 2>/dev/null)" = "$EXPECTED_KERNEL" ] || preflight_fail unsupported-kernel
+	[ "$(uname -m 2>/dev/null)" = "$EXPECTED_MACHINE" ] || preflight_fail unsupported-machine-architecture
+	if ! module_valid >/dev/null 2>&1; then preflight_fail "bundle-$MODULE_REASON"; fi
+	if [ -d "$CUSTOM_GADGET" ]; then preflight_fail custom-gadget-already-exists; fi
+	for gadget in "$GADGET_ROOT"/*; do
+		[ -d "$gadget" ] || continue
+		[ -z "$(udc_value "$gadget")" ] || preflight_fail "udc-already-bound-$(basename "$gadget")"
+	done
+	if [ -d "$NET_ROOT/$NET_NAME" ]; then
+		state=$(usb0_state)
+		carrier=$(usb0_carrier)
+		[ "$state" = up ] && preflight_fail usb0-already-up
+		[ "$carrier" = 1 ] && preflight_fail usb0-carrier-already-up
+	fi
+	[ "$(management_path_state)" = ok ] || preflight_fail management-lan-unavailable
+}
+
+custom_topology_safe() {
+	[ -d "$CUSTOM_GADGET" ] || return 1
+	[ ! -L "$CUSTOM_GADGET" ] || return 1
+	[ -d "$CUSTOM_GADGET/configs" ] || return 1
+	[ -d "$CUSTOM_CONFIG" ] || return 1
+	[ -d "$CUSTOM_GADGET/functions" ] || return 1
+	[ -d "$CUSTOM_FUNCTION" ] || return 1
+	[ -L "$CUSTOM_LINK" ] || return 1
+	[ "$(readlink "$CUSTOM_LINK" 2>/dev/null || true)" = "../../functions/$FUNCTION_NAME" ] || return 1
+	for item in "$CUSTOM_GADGET/functions"/*; do
+		[ -e "$item" ] || [ -L "$item" ] || continue
+		[ "$(basename "$item")" = "$FUNCTION_NAME" ] || return 1
+	done
+	for item in "$CUSTOM_GADGET/configs"/*; do
+		[ -e "$item" ] || [ -L "$item" ] || continue
+		[ "$(basename "$item")" = "$CONFIG_NAME" ] || return 1
+	done
+	for item in "$CUSTOM_CONFIG"/*; do
+		[ -e "$item" ] || [ -L "$item" ] || continue
+		base=$(basename "$item")
+		case "$base" in
+			"$FUNCTION_NAME") [ -L "$item" ] || return 1; [ "$(readlink "$item" 2>/dev/null || true)" = "../../functions/$FUNCTION_NAME" ] || return 1 ;;
+			MaxPower|bmAttributes) [ -f "$item" ] || return 1 ;;
+			*) return 1 ;;
+		esac
+	done
+	for item in "$CUSTOM_GADGET"/*; do
+		[ -e "$item" ] || [ -L "$item" ] || continue
+		base=$(basename "$item")
+		case "$base" in
+			configs|functions|idVendor|idProduct|UDC|bcdUSB|bcdDevice|max_speed|os_desc) : ;;
+			strings) return 1 ;;
+			*) return 1 ;;
+		esac
+	done
+	return 0
+}
+
+ensure_state_dir() {
+	private_dir "$STATE_DIR" || return 1
+	private_dir "$STATE_DIR/snapshots" || return 1
+}
+
+state_file_ready() {
+	file=$1
+	private_dir "$STATE_DIR" || return 1
+	private_path "$file" || return 1
+	if [ -e "$file" ]; then private_file "$file" || return 1; fi
+}
+
+capture_snapshot() {
+	ensure_state_dir || return 1
+	stamp=$(date +%Y%m%d-%H%M%S 2>/dev/null || printf 'unknown')
+	SNAPSHOT_PATH=$STATE_DIR/snapshots/baseline.$stamp.$$
+	private_path "$SNAPSHOT_PATH" || return 1
+	mkdir "$SNAPSHOT_PATH" 2>/dev/null || return 1
+	chmod 700 "$SNAPSHOT_PATH" 2>/dev/null || return 1
+	{
+		printf 'udc=%s\n' "$UDC_NAME"
+		printf 'vendor_udc=%s\n' "$(udc_value "$GADGET_ROOT/g1")"
+		printf 'udc_state=%s\n' "$(read_one "$UDC_ROOT/$UDC_NAME/state" unknown)"
+		printf 'udc_current_speed=%s\n' "$(read_one "$UDC_ROOT/$UDC_NAME/current_speed" unknown)"
+		printf 'usb0_state=%s\n' "$(usb0_state)"
+		printf 'usb0_carrier=%s\n' "$(usb0_carrier)"
+		printf 'management_path=%s\n' "$(management_path_state)"
+	} > "$SNAPSHOT_PATH/state"
+	chmod 600 "$SNAPSHOT_PATH/state" 2>/dev/null || return 1
+	if [ -d "$GADGET_ROOT" ]; then
+		find "$GADGET_ROOT" -maxdepth 4 -print 2>/dev/null > "$SNAPSHOT_PATH/configfs.tree" || return 1
+		{
+			while IFS= read -r item; do
+				[ -n "$item" ] || continue
+				if [ -L "$item" ]; then
+					printf 'link=%s -> %s\n' "$item" "$(readlink "$item" 2>/dev/null || true)"
+				elif [ -f "$item" ]; then
+					printf 'file=%s\n' "$item"
+					cat "$item" 2>/dev/null || true
+					printf '\n'
+				else
+					printf 'directory=%s\n' "$item"
+				fi
+			done < "$SNAPSHOT_PATH/configfs.tree"
+		} > "$SNAPSHOT_PATH/configfs.values"
+		chmod 600 "$SNAPSHOT_PATH/configfs.values" 2>/dev/null || return 1
+	fi
+	if [ -r "$UDC_ROOT/$UDC_NAME/uevent" ]; then
+		cat "$UDC_ROOT/$UDC_NAME/uevent" > "$SNAPSHOT_PATH/udc.uevent" 2>/dev/null || return 1
+		chmod 600 "$SNAPSHOT_PATH/udc.uevent" 2>/dev/null || return 1
+	fi
+	if [ -r "$PROC_MODULES" ]; then
+		cat "$PROC_MODULES" > "$SNAPSHOT_PATH/proc.modules" 2>/dev/null || return 1
+	fi
+	state_file_ready "$STATE_DIR/last_snapshot" || return 1
+	printf '%s\n' "$SNAPSHOT_PATH" > "$STATE_DIR/last_snapshot"
+	chmod 600 "$STATE_DIR/last_snapshot" 2>/dev/null || return 1
+}
+
+write_runtime_state() {
+	ensure_state_dir || return 1
+	state_file_ready "$STATE_DIR/runtime-state" || return 1
+	printf '%s\n' "$1" > "$STATE_DIR/runtime-state"
+	chmod 600 "$STATE_DIR/runtime-state" 2>/dev/null || return 1
+}
+
+capture_failure() {
+	ensure_state_dir >/dev/null 2>&1 || return 0
+	failure=$STATE_DIR/last-failure
+	state_file_ready "$failure" >/dev/null 2>&1 || return 0
+	{
+		printf 'reason=%s\n' "$1"
+		printf 'custom_udc=%s\n' "$(udc_value "$CUSTOM_GADGET")"
+		printf 'udc_state=%s\n' "$(read_one "$UDC_ROOT/$UDC_NAME/state" unknown)"
+		printf 'udc_current_speed=%s\n' "$(read_one "$UDC_ROOT/$UDC_NAME/current_speed" unknown)"
+		printf 'usb0_state=%s\n' "$(usb0_state)"
+		printf 'usb0_carrier=%s\n' "$(usb0_carrier)"
+	} > "$failure"
+	chmod 600 "$failure" 2>/dev/null || true
+}
+
+remove_known_attributes() {
+	# These are exact attributes created by this helper. On real ConfigFS they
+	# are virtual and rm fails harmlessly; ordinary fixtures can clean them.
+	rm -f "$CUSTOM_FUNCTION/dev_addr" "$CUSTOM_FUNCTION/host_addr" \
+		"$CUSTOM_GADGET/idVendor" "$CUSTOM_GADGET/idProduct" "$CUSTOM_GADGET/UDC" 2>/dev/null || true
+}
+
+rollback_custom() {
+	[ -e "$CUSTOM_GADGET" ] || [ -L "$CUSTOM_GADGET" ] || return 0
+	custom_topology_safe || return 1
+	current=$(udc_value "$CUSTOM_GADGET")
+	if [ -n "$current" ]; then
+		[ "$current" = "$UDC_NAME" ] || return 1
+		printf '\n' > "$CUSTOM_GADGET/UDC" 2>/dev/null || return 1
+		[ -z "$(udc_value "$CUSTOM_GADGET")" ] || return 1
+	fi
+	rm -f "$CUSTOM_LINK" 2>/dev/null || return 1
+	rmdir "$CUSTOM_FUNCTION" 2>/dev/null || { remove_known_attributes; rmdir "$CUSTOM_FUNCTION" 2>/dev/null || return 1; }
+	rmdir "$CUSTOM_CONFIG" 2>/dev/null || return 1
+	rmdir "$CUSTOM_GADGET/functions" 2>/dev/null || return 1
+	rmdir "$CUSTOM_GADGET/configs" 2>/dev/null || return 1
+	remove_known_attributes
+	rmdir "$CUSTOM_GADGET" 2>/dev/null || return 1
+	return 0
+}
+
+status_fields() {
+	preflight_check
+	if [ ! -f "$MODULE_PATH" ]; then
+		MODULE_REASON=missing
+		bundle=missing
+	elif module_valid >/dev/null 2>&1; then
+		bundle=installed
+	else
+		bundle=invalid-hash
+	fi
+	profile_state=invalid
+	if [ ! -f "$PROFILE" ] || [ -L "$PROFILE" ]; then
+		profile_state=missing
+	elif profile_valid >/dev/null 2>&1; then
+		profile_state=valid
+	fi
+	custom_state=absent
+	if [ -d "$CUSTOM_GADGET" ]; then custom_state=present; fi
+	runtime_state=$(read_one "$STATE_DIR/runtime-state" disabled)
+	if [ "$custom_state" = present ]; then
+		bound=$(udc_value "$CUSTOM_GADGET")
+		[ "$bound" = "$UDC_NAME" ] && runtime_state=active
+		custom_topology_safe || runtime_state=rollback-required
+	fi
+	[ "$PREFLIGHT_OK" -eq 1 ] || [ "$runtime_state" = active ] || runtime_state=preflight-ng
+	printf 'result=ok\n'
+	printf 'bundle=%s\n' "$bundle"
+	printf 'bundle_reason=%s\n' "${MODULE_REASON:-ok}"
+	printf 'support_level=experimental-b2-live-validated-provenance-based\n'
+	printf 'kernel=%s\n' "$(uname -r 2>/dev/null || printf unknown)"
+	printf 'architecture=%s\n' "$(uname -m 2>/dev/null || printf unknown)"
+	printf 'module_name=%s\n' "$MODULE_NAME"
+	printf 'driver_sha256=%s\n' "$EXPECTED_SHA256"
+	printf 'driver_vermagic=%s\n' "$EXPECTED_VERMAGIC"
+	printf 'license=GPL-2.0-only\n'
+	printf 'upstream_revision=97f55791dd0de4161cb2a9bd06ab9799ff580a8d\n'
+	printf 'udc=%s\n' "$UDC_NAME"
+	printf 'udc_present=%s\n' "$([ -d "$UDC_ROOT/$UDC_NAME" ] && printf 1 || printf 0)"
+	printf 'udc_state=%s\n' "$(read_one "$UDC_ROOT/$UDC_NAME/state" unknown)"
+	printf 'udc_current_speed=%s\n' "$(read_one "$UDC_ROOT/$UDC_NAME/current_speed" unknown)"
+	printf 'udc_bound_gadget=%s\n' "$(bound_gadget)"
+	printf 'vendor_gadget=%s\n' "$([ -d "$GADGET_ROOT/g1" ] && printf g1 || printf none)"
+	printf 'custom_gadget=%s\n' "$custom_state"
+	printf 'runtime=%s\n' "$runtime_state"
+	printf 'module_loaded=%s\n' "$(module_loaded_value)"
+	printf 'loaded_usb_modules=%s\n' "$(loaded_usb_modules)"
+	printf 'snapshot=%s\n' "$(read_one "$STATE_DIR/last_snapshot" none)"
+	printf 'profile=%s\n' "$profile_state"
+	printf 'profile_reason=%s\n' "$PROFILE_REASON"
+	printf 'profile_path=%s\n' "$PROFILE"
+	printf 'usb0_state=%s\n' "$(usb0_state)"
+	printf 'usb0_carrier=%s\n' "$(usb0_carrier)"
+	printf 'management_path=%s\n' "$(management_path_state)"
+	printf 'preflight=%s\n' "$([ "$PREFLIGHT_OK" -eq 1 ] && printf ok || printf ng)"
+	printf 'preflight_reason=%s\n' "$PREFLIGHT_REASON"
+	printf 'rollback=%s\n' "$(read_one "$STATE_DIR/rollback-state" none)"
+}
+
+enable_fail() {
+	reason=$1
+	capture_failure "$reason"
+	if [ "$USB0_ADDRESS_ADDED" -eq 1 ] && command -v ip >/dev/null 2>&1; then
+		ip addr del "$USB0_ADDR" dev "$NET_NAME" 2>/dev/null || true
+		ip link set "$NET_NAME" down 2>/dev/null || true
+	fi
+	if rollback_custom; then
+		write_runtime_state disabled >/dev/null 2>&1 || true
+		printf 'result=error\nerror=%s\nrollback=completed\nruntime=disabled\n' "$reason"
+	else
+		write_runtime_state rollback-required >/dev/null 2>&1 || true
+		printf 'result=error\nerror=%s\nrollback=required\nruntime=rollback-required\n' "$reason"
+	fi
+	exit 1
+}
+
+enable() {
+	[ "$1" = --ack ] || die 'explicit acknowledgement is required (--ack)'
+	preflight_check
+	[ "$PREFLIGHT_OK" -eq 1 ] || enable_fail "preflight:$PREFLIGHT_REASON"
+	profile_valid || enable_fail "profile:$PROFILE_REASON"
+	module_valid || enable_fail "bundle:$MODULE_REASON"
+	ensure_state_dir || enable_fail state-directory-unavailable
+	capture_snapshot || enable_fail snapshot-failed
+	if ! module_loaded; then
+		command -v insmod >/dev/null 2>&1 || enable_fail insmod-missing
+		insmod "$MODULE_PATH" 2>/dev/null || enable_fail module-load-failed
+	fi
+	module_loaded || enable_fail module-not-visible-after-load
+	[ -d "$GADGET_ROOT" ] || enable_fail configfs-disappeared
+	mkdir -p "$CUSTOM_CONFIG" "$CUSTOM_FUNCTION" 2>/dev/null || enable_fail custom-topology-create-failed
+	printf '%s\n' "$VID_HEX" > "$CUSTOM_GADGET/idVendor" 2>/dev/null || enable_fail idVendor-write-failed
+	printf '%s\n' "$PID_HEX" > "$CUSTOM_GADGET/idProduct" 2>/dev/null || enable_fail idProduct-write-failed
+	printf '%s\n' "$DEV_MAC" > "$CUSTOM_FUNCTION/dev_addr" 2>/dev/null || enable_fail dev-mac-write-failed
+	printf '%s\n' "$HOST_MAC" > "$CUSTOM_FUNCTION/host_addr" 2>/dev/null || enable_fail host-mac-write-failed
+	ln -s "../../functions/$FUNCTION_NAME" "$CUSTOM_LINK" 2>/dev/null || enable_fail function-link-failed
+	[ "$(readlink "$CUSTOM_LINK" 2>/dev/null || true)" = "../../functions/$FUNCTION_NAME" ] || enable_fail function-link-verification-failed
+	printf '%s\n' "$UDC_NAME" > "$CUSTOM_GADGET/UDC" 2>/dev/null || enable_fail udc-bind-failed
+	[ "$(udc_value "$CUSTOM_GADGET")" = "$UDC_NAME" ] || enable_fail udc-bind-verification-failed
+	command -v ip >/dev/null 2>&1 || enable_fail ip-missing
+	[ -d "$NET_ROOT/$NET_NAME" ] || enable_fail usb0-missing-after-bind
+	if ! ip -4 addr show dev "$NET_NAME" 2>/dev/null | grep -q "$USB0_ADDR"; then
+		ip addr add "$USB0_ADDR" dev "$NET_NAME" 2>/dev/null || enable_fail usb0-address-failed
+		USB0_ADDRESS_ADDED=1
+	fi
+	ip link set "$NET_NAME" up 2>/dev/null || enable_fail usb0-up-failed
+	custom_topology_safe || enable_fail custom-topology-verification-failed
+	state_file_ready "$STATE_DIR/usb0-address-added" || enable_fail runtime-state-write-failed
+	printf '%s\n' "$USB0_ADDRESS_ADDED" > "$STATE_DIR/usb0-address-added"
+	chmod 600 "$STATE_DIR/usb0-address-added" 2>/dev/null || enable_fail runtime-state-write-failed
+	write_runtime_state active || enable_fail runtime-state-write-failed
+	printf 'result=enabled\nruntime=active\nsnapshot=%s\nudc=%s\nudc_state=%s\nudc_current_speed=%s\ncustom_gadget=%s\nusb0=%s\nusb0_state=%s\nusb0_carrier=%s\n' \
+		"$SNAPSHOT_PATH" "$UDC_NAME" "$(read_one "$UDC_ROOT/$UDC_NAME/state" unknown)" \
+		"$(read_one "$UDC_ROOT/$UDC_NAME/current_speed" unknown)" "$GADGET_NAME" "$NET_NAME" "$(usb0_state)" "$(usb0_carrier)"
+}
+
+disable() {
+	if [ ! -d "$CUSTOM_GADGET" ]; then
+		write_runtime_state disabled >/dev/null 2>&1 || true
+		printf 'result=ok\nruntime=disabled\nrollback=not-needed\n'
+		return 0
+	fi
+	custom_topology_safe || {
+		write_runtime_state rollback-required >/dev/null 2>&1 || true
+		printf 'result=error\nerror=custom-topology-unknown\nrollback=required\nruntime=rollback-required\n'
+		return 1
+	}
+	current=$(udc_value "$CUSTOM_GADGET")
+	if [ -n "$current" ]; then
+		[ "$current" = "$UDC_NAME" ] || {
+			printf 'result=error\nerror=unexpected-udc-binding\nrollback=required\nruntime=rollback-required\n'
+			return 1
+		}
+		printf '\n' > "$CUSTOM_GADGET/UDC" 2>/dev/null || {
+			printf 'result=error\nerror=udc-unbind-failed\nrollback=required\nruntime=rollback-required\n'
+			return 1
+		}
+		[ -z "$(udc_value "$CUSTOM_GADGET")" ] || {
+			printf 'result=error\nerror=udc-still-bound\nrollback=required\nruntime=rollback-required\n'
+			return 1
+		}
+	fi
+	added=$(read_one "$STATE_DIR/usb0-address-added" 0)
+	if [ "$added" = 1 ]; then
+		profile_valid || {
+			write_runtime_state rollback-required >/dev/null 2>&1 || true
+			printf 'result=error\nerror=profile-required-to-remove-usb0-address\nrollback=required\nruntime=rollback-required\n'
+			return 1
+		}
+		command -v ip >/dev/null 2>&1 || return 1
+		ip addr del "$USB0_ADDR" dev "$NET_NAME" 2>/dev/null || {
+			printf 'result=error\nerror=usb0-address-remove-failed\nrollback=required\nruntime=rollback-required\n'
+			return 1
+		}
+		ip link set "$NET_NAME" down 2>/dev/null || true
+	fi
+	rollback_custom || {
+		write_runtime_state rollback-required >/dev/null 2>&1 || true
+		printf 'result=error\nerror=custom-topology-cleanup-failed\nrollback=required\nruntime=rollback-required\n'
+		return 1
+	}
+	write_runtime_state disabled >/dev/null 2>&1 || true
+	if state_file_ready "$STATE_DIR/usb0-address-added"; then
+		printf '0\n' > "$STATE_DIR/usb0-address-added" 2>/dev/null || true
+	fi
+	printf 'result=ok\nruntime=disabled\nrollback=completed\nvendor_restore=not-needed\n'
+}
+
+action=${1:-status}
+case "$action" in
+	status)
+		status_fields
+		;;
+	preflight)
+		status_fields
+		[ "$PREFLIGHT_OK" -eq 1 ]
+		;;
+	enable)
+		[ "$#" -eq 2 ] || die 'usage: sbair-usb-nic enable --ack'
+		enable "$2"
+		;;
+	disable)
+		[ "$#" -eq 1 ] || die 'usage: sbair-usb-nic disable'
+		disable
+		;;
+	*) die "unknown command: $action" ;;
+esac

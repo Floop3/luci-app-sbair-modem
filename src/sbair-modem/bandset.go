@@ -5,7 +5,6 @@ package main
 
 import (
 	"fmt"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,7 +22,7 @@ import (
 // バンドを間違えて WAN が落ちても操作は続けられる。**それでも自動で
 // 巻き戻す** — 「適用したら戻せなくなった」を作らないため。
 //
-// 書式と実測は sbair6-rs の docs/AT.md「バンドを変える」。
+// 書式と実測は、対象機体で確認した仕様に従う。
 const (
 	bandPoll     = 3 * time.Second
 	bandPollMax  = 45 * time.Second
@@ -201,7 +200,7 @@ func runBandWorker(lteArg, nrArg string) int {
 	}
 	time.Sleep(bandSettle)
 	if !waitRegistered(ch, j) {
-		_, _ = exec.Command("ifup", "wan").CombinedOutput()
+		_, _ = ifupWAN()
 		return j.fail("巻き戻し",
 			"指定したバンドではつながらず、元の設定に戻しましたが、まだネットワークにつながっていません。"+
 				"しばらく待つか、モデムをリセットしてください。")
@@ -212,11 +211,17 @@ func runBandWorker(lteArg, nrArg string) int {
 
 // finishBandSet brings the WAN back and records what is now in effect.
 func finishBandSet(ch *ATChannel, j *job, applied []string, msg string) int {
-	j.step("WAN を張り直す")
+	j.step("WAN状態を確認")
 	// **AT を握ったまま ifup しない。** その先で ql_datacall が AT を使う。
 	ch.Disconnect()
-	if out, err := exec.Command("ifup", "wan").CombinedOutput(); err != nil {
+	if out, err := ifupWAN(); err != nil {
 		return j.fail("ifup wan", fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out))))
+	}
+	if !cellularWANAllowed() {
+		if msg == "" {
+			return 0
+		}
+		return j.done("完了", msg+" APモードのためWANは起動していません。")
 	}
 	if msg == "" {
 		return 0
@@ -358,7 +363,7 @@ const (
 // ⚠ **モデムは OS より遅れて初期化をやり直し、そのときバンドが出荷既定へ
 // 戻る。** つまり **`sbair-modem boot` の中で 1 回書くだけでは足りない** —
 // 起動直後に書いた値は十数秒後に消される。消されたら書き直し、
-// しばらく保ったら抜ける。実測した時刻は sbair6-rs の docs/AT.md。
+// しばらく保ったら抜ける。保持時間は対象機体で実測して決める。
 //
 // **これは boot の最後でだけ回す。** 頭に置くと APN と WAN がこの時間ぶん
 // 待たされる。init スクリプトが setsid で切り離しているので、

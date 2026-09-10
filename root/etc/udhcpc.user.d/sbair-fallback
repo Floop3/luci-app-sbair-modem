@@ -1,0 +1,33 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 syado
+#
+# OpenWrt 21.02's dhcp.script passes bound/renew as $1. Vendor udhcpc
+# variants may also export ACTION, so accept both forms. A few wrappers pass
+# logical, physical, action positionally; accept those too.
+event=
+case "${ACTION:-}" in bound|renew) event=$ACTION;; esac
+for dhcp_arg in "${1:-}" "${2:-}" "${3:-}"; do
+	case "$dhcp_arg" in
+		bound|renew) [ -n "$event" ] || event=$dhcp_arg;;
+	esac
+done
+case "$event" in
+	bound|renew) ;;
+	*) exit 0;;
+esac
+[ "$(uci -q get sbair.bridge.mode 2>/dev/null)" = ap ] || exit 0
+[ "$(uci -q get sbair.bridge.managed 2>/dev/null)" = 1 ] || exit 0
+
+logical=${INTERFACE:-}
+physical=${interface:-${IFACE:-}}
+for dhcp_arg in "${1:-}" "${2:-}" "${3:-}"; do
+	case "$dhcp_arg" in
+		lan) [ -n "$logical" ] || logical=$dhcp_arg;;
+		br-lan) [ -n "$physical" ] || physical=$dhcp_arg;;
+	esac
+done
+[ "$logical" = lan ] || [ "$physical" = br-lan ] || exit 0
+
+NETMODE=${SBAIR_NETMODE_BIN:-/usr/sbin/sbair-netmode}
+"$NETMODE" dhcp-event "$logical" "$physical" "$event" >/dev/null 2>&1 || true

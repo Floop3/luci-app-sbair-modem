@@ -1,0 +1,18 @@
+# Pinned optional USB CDC-NCM gadget bundle for SoftBank Air 6 / SBA6D.
+# This is metadata, not shell input. Consumers must parse the keys explicitly.
+UPSTREAM_REPOSITORY=https://github.com/Karin-Laboratory/sbat6-usb-nic
+UPSTREAM_REVISION=97f55791dd0de4161cb2a9bd06ab9799ff580a8d
+ARTIFACT_FILENAME=t6a_usb_ncm_65532_candidate_v1.ko
+ARTIFACT_URL=https://raw.githubusercontent.com/Karin-Laboratory/sbat6-usb-nic/97f55791dd0de4161cb2a9bd06ab9799ff580a8d/artifacts/t6a_usb_ncm_65532_candidate_v1.ko
+SHA256=7f0e5f3ec197a5f80f23195a3945a2d700bca9d97b8c04eadbacb02c247523c1
+MODULE_NAME=t6a_usb_ncm_65532_candidate_v1
+KERNEL_RELEASE=5.4.238
+ARCHITECTURE=aarch64
+VERMAGIC=5.4.238 SMP mod_unload modversions aarch64
+LICENSE=GPL-2.0-only
+SUPPORT_LEVEL=experimental-b2-live-validated-provenance-based
+GADGET=t6a_ncm_test
+FUNCTION=t6a_ncm.test0
+CONFIG=c.1
+UDC=11201000.usb
+NETWORK=usb0

@@ -4,14 +4,17 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 )
 
-// Wi-Fi の現状表示のみ(Phase 1)。書き込みは行わない。
+// Wi-Fi の現状表示と既存の編集経路。ドリフト監視は wifi_drift.go に分離し、
+// 通常のmonitor daemonからは書き込みを行わない。
 //
 // mt_wifi は netifd の無線ドライバスクリプトに対応が無く、LuCI標準の
 // Network → Wireless では触れない。設定を書き換えた
@@ -60,6 +63,10 @@ func parseWireless() (map[string]map[string]string, []string, error) {
 			continue
 		}
 		section, field := rest[:sub], rest[sub+1:]
+		switch strings.ToLower(field) {
+		case "key", "password", "passphrase", "psk", "wpa_psk", "wps_pin", "sae_password":
+			continue
+		}
 		if sections[section] == nil {
 			sections[section] = map[string]string{}
 			order = append(order, section)
@@ -116,11 +123,16 @@ func wifiStatus() map[string]any {
 	// チャンネルはインターフェースではなく無線デバイス(radio)単位の値。
 	// 編集画面がband別に1つずつ出せるよう、別枠で返す。
 	type radioInfo struct {
-		Device    string `json:"device"`
-		Band      string `json:"band"`
-		Channel   string `json:"channel"`
-		Bandwidth string `json:"bandwidth"` // htmodeの末尾の数字(MHz)。wifiSetBandwidth参照
-		Protocol  string `json:"protocol"`  // "ax"/"be"等。wifiSetProtocol参照
+		Device            string `json:"device"`
+		Band              string `json:"band"`
+		Channel           string `json:"channel"`   // UCI configured value (legacy field)
+		Bandwidth         string `json:"bandwidth"` // UCI htmode width (legacy field)
+		Protocol          string `json:"protocol"`  // UCI configured profile
+		Source            string `json:"source"`
+		ChannelPolicy     string `json:"channel_policy"`
+		ConfiguredChannel string `json:"configured_channel"`
+		BandwidthPolicy   string `json:"bandwidth_policy"`
+		ConfiguredWidth   string `json:"configured_bandwidth"`
 	}
 	var radios []radioInfo
 	for _, name := range order {
@@ -128,8 +140,11 @@ func wifiStatus() map[string]any {
 		if b, ok := f["band"]; ok {
 			radios = append(radios, radioInfo{
 				Device: name, Band: b, Channel: f["channel"],
-				Bandwidth: htmodeWidth(f["htmode"]),
-				Protocol:  protocolValueFromHtmode(b, f["htmode"], f["pure_11b"]),
+				Bandwidth:     htmodeWidth(f["htmode"]),
+				Protocol:      protocolValueFromHtmode(b, f["htmode"], f["pure_11b"]),
+				Source:        "uci",
+				ChannelPolicy: driftPolicy(f["channel"]), ConfiguredChannel: driftChannel(f["channel"]),
+				BandwidthPolicy: driftPolicy(f["htmode"]), ConfiguredWidth: driftWidth(f["htmode"]),
 			})
 		}
 	}
@@ -235,16 +250,46 @@ func reconcileSSID2LanBlock() {
 // 呼び出し元プロセス(rpcdが呼ぶ`sbair-modem`はリクエスト毎に1回起動して
 // 終了する使い捨てプロセス)がHTTP応答を返した直後に終了しても子プロセスが
 // 道連れにならないよう、`Setsid: true`でセッションを分離する。
-func applyWifiRestart() {
-	cmd := exec.Command("sh", "-c", "knsh wlan restart; "+
+func applyWifiRestart() error {
+	cmd := exec.Command("sh", "-c", "/usr/bin/sbair-modem wifi-drift snapshot wlan_restart_before >/dev/null 2>&1; "+
+		"knsh wlan restart; "+
 		"mode=\"$(uci -q get dhcp.lan.ignore)\"; "+
 		"if [ \"$mode\" = \"1\" ]; then "+
 		"ebtables -t nat -D postrouting_wlan2lan --mark 0x102 -j DROP 2>/dev/null; "+
 		"ebtables -t nat -D postrouting_wlan2lan --mark 0x202 -j DROP 2>/dev/null; "+
 		"ebtables -t nat -D postrouting_wlan2lan --mark 0x302 -j DROP 2>/dev/null; "+
-		"fi")
+		"fi; /usr/bin/sbair-modem wifi-drift snapshot wlan_restart_after >/dev/null 2>&1")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	_ = cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("Wi-Fi再起動の開始に失敗しました: %v", err)
+	}
+	return nil
+}
+
+func runKnshSave() error {
+	if err := exec.Command("knsh", "save").Run(); err != nil {
+		// Do not include command output here: future vendor versions might echo
+		// wireless credentials while reporting an error.
+		return fmt.Errorf("knsh saveに失敗しました: %v", err)
+	}
+	return nil
+}
+
+func finishWifiApply() map[string]any {
+	wifiDriftRecord("wifi_apply_before_save")
+	if err := runKnshSave(); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	wifiDriftRecord("wifi_apply_after_save")
+	if err := applyWifiRestart(); err != nil {
+		return map[string]any{"error": err.Error(), "saved": true}
+	}
+	return map[string]any{
+		"result":          "started",
+		"saved":           true,
+		"wifi_restarting": true,
+		"restart_async":   true,
+	}
 }
 
 // wifiSet はSSID・ステルス・有効/無効・パスワードを変更する(Phase 2)。
@@ -270,66 +315,355 @@ var validEncryption2G5G = map[string]bool{
 }
 var validEncryption6G = map[string]bool{"owe": true, "sae": true}
 
-// wifiApply は保留中のuci変更(wifiSet/wifiSetChannel/wifiSetBandwidth/wifiSetProtocolを
-// apply="0"で呼んだ分)をまとめて反映する。画面側で複数箇所を編集してから
-// 最後に1回だけ呼ぶことを想定(`knsh wlan restart`によるWi-Fi瞬断は1回で済む)。
+// wifiApply は互換用の保留変更反映。新しい画面は検証から再起動までを
+// wifiApplyBatchで一括して行う。
 func wifiApply() map[string]any {
-	_ = exec.Command("knsh", "save").Run()
-	applyWifiRestart()
-	return map[string]any{"result": "ok", "wifi_restarting": true}
+	return finishWifiApply()
 }
 
-func wifiSet(iface, ssid, hidden, disabled, password, encryption, apply string) map[string]any {
-	if iface == "" {
-		return map[string]any{"error": "iface is required"}
+type wifiBatchRequest struct {
+	Interfaces []wifiBatchInterface `json:"interfaces"`
+	Bands      []wifiBatchBand      `json:"bands"`
+}
+
+type wifiBatchInterface struct {
+	Iface      string `json:"iface"`
+	SSID       string `json:"ssid"`
+	Hidden     string `json:"hidden"`
+	Disabled   string `json:"disabled"`
+	Password   string `json:"password"`
+	Encryption string `json:"encryption"`
+}
+
+type wifiBatchBand struct {
+	Band     string `json:"band"`
+	Channel  string `json:"channel"`
+	Width    string `json:"bandwidth"`
+	Protocol string `json:"protocol"`
+}
+
+// SBA6D's MT7990 vendor configuration uses txpower=100 as its maximum
+// firmware power scale. It is a vendor value, not a dBm value. Keep the
+// regulatory country/region untouched: this action only asks the existing
+// firmware profile for its maximum and never bypasses its regulatory table.
+const maxFirmwareTxPower = "100"
+
+func wifiTxPowerMax() map[string]any {
+	sections, order, err := parseWireless()
+	if err != nil {
+		return map[string]any{"error": fmt.Sprintf("uci show wireless: %v", err)}
 	}
-	band, ok := wifiAPBands()[iface]
-	if !ok {
-		return map[string]any{"error": fmt.Sprintf("unknown AP interface %q", iface)}
+	if pending, pendingErr := uci("changes", "wireless"); pendingErr == nil && strings.TrimSpace(pending) != "" {
+		return map[string]any{"error": "wirelessに未コミットの別変更があります。先に保存または破棄してください"}
 	}
-	if encryption != "" && !validEncryption[encryption] {
-		return map[string]any{"error": fmt.Sprintf("unknown encryption %q", encryption)}
-	}
-	if encryption != "" {
-		allowed := validEncryption2G5G
-		if band == "6G" {
-			allowed = validEncryption6G
+
+	var radios []string
+	changed := false
+	for _, name := range order {
+		if sections[name]["band"] == "" {
+			continue
 		}
-		if !allowed[encryption] {
-			return map[string]any{"error": fmt.Sprintf("encryption %q is not supported on %s by this hardware/firmware", encryption, band)}
+		radios = append(radios, name)
+		if sections[name]["txpower"] == maxFirmwareTxPower {
+			continue
+		}
+		if _, err := uci("set", "wireless."+name+".txpower="+maxFirmwareTxPower); err != nil {
+			_, _ = uci("revert", "wireless")
+			return map[string]any{"error": "無線出力設定の書き込みに失敗しました"}
+		}
+		changed = true
+	}
+	if len(radios) == 0 {
+		return map[string]any{"error": "無線デバイスが見つかりません"}
+	}
+	if !changed {
+		return map[string]any{
+			"result":                   "already_max",
+			"txpower":                  maxFirmwareTxPower,
+			"radios":                   radios,
+			"regulatory_settings_kept": true,
+		}
+	}
+	if _, err := uci("commit", "wireless"); err != nil {
+		_, _ = uci("revert", "wireless")
+		return map[string]any{"error": fmt.Sprintf("uci commit wireless: %v", err)}
+	}
+	result := finishWifiApply()
+	result["txpower"] = maxFirmwareTxPower
+	result["radios"] = radios
+	result["regulatory_settings_kept"] = true
+	return result
+}
+
+// Delete the explicit vendor scale so mt_wifi/firmware can use its normal
+// default. This is intentionally different from setting an arbitrary numeric
+// value: txpower=100 is a firmware scale, not a dBm value, and the default is
+// owned by the existing device profile.
+func wifiTxPowerDefault() map[string]any {
+	sections, order, err := parseWireless()
+	if err != nil {
+		return map[string]any{"error": fmt.Sprintf("uci show wireless: %v", err)}
+	}
+	if pending, pendingErr := uci("changes", "wireless"); pendingErr == nil && strings.TrimSpace(pending) != "" {
+		return map[string]any{"error": "wirelessに未コミットの別変更があります。先に保存または破棄してください"}
+	}
+
+	var radios []string
+	changed := false
+	for _, name := range order {
+		if sections[name]["band"] == "" {
+			continue
+		}
+		radios = append(radios, name)
+		if sections[name]["txpower"] == "" {
+			continue
+		}
+		if _, err := uci("delete", "wireless."+name+".txpower"); err != nil {
+			_, _ = uci("revert", "wireless")
+			return map[string]any{"error": "無線出力設定の削除に失敗しました"}
+		}
+		changed = true
+	}
+	if len(radios) == 0 {
+		return map[string]any{"error": "無線デバイスが見つかりません"}
+	}
+	if !changed {
+		return map[string]any{
+			"result":                   "already_default",
+			"txpower":                  "default",
+			"radios":                   radios,
+			"regulatory_settings_kept": true,
+		}
+	}
+	if _, err := uci("commit", "wireless"); err != nil {
+		_, _ = uci("revert", "wireless")
+		return map[string]any{"error": fmt.Sprintf("uci commit wireless: %v", err)}
+	}
+	result := finishWifiApply()
+	result["txpower"] = "default"
+	result["radios"] = radios
+	result["regulatory_settings_kept"] = true
+	return result
+}
+
+func wifiRadioForBand(sections map[string]map[string]string, order []string, band string) (string, map[string]string) {
+	for _, name := range order {
+		if sections[name]["band"] == band {
+			return name, sections[name]
+		}
+	}
+	return "", nil
+}
+
+func validWiFiChannel(value string) bool {
+	n, err := strconv.Atoi(value)
+	return err == nil && n >= 0 && n <= 233
+}
+
+func validBinaryOption(value string) bool {
+	return value == "" || value == "0" || value == "1"
+}
+
+func protocolOption(band, value string) (*protocolOpt, bool) {
+	for i := range protocolChoices[band] {
+		if protocolChoices[band][i].Value == value {
+			return &protocolChoices[band][i], true
+		}
+	}
+	return nil, false
+}
+
+// wifiApplyBatch validates every requested mutation before touching UCI. The
+// vendor channel command is inherently runtime-immediate, so it is performed
+// only after UCI validation/commit and is reported as a non-atomic operation.
+func wifiApplyBatch(changes string) map[string]any {
+	if strings.TrimSpace(changes) == "" || len(changes) > 64*1024 {
+		return map[string]any{"error": "Wi-Fi一括変更のデータが不正です"}
+	}
+	var request wifiBatchRequest
+	if err := json.Unmarshal([]byte(changes), &request); err != nil {
+		return map[string]any{"error": "Wi-Fi一括変更のデータを読み取れません"}
+	}
+	if len(request.Interfaces) == 0 && len(request.Bands) == 0 {
+		return map[string]any{"result": "noop"}
+	}
+	sections, order, err := parseWireless()
+	if err != nil {
+		return map[string]any{"error": fmt.Sprintf("uci show wireless: %v", err)}
+	}
+	// Do not discard another writer's staged UCI edits when an operation fails.
+	if pending, pendingErr := uci("changes", "wireless"); pendingErr == nil && strings.TrimSpace(pending) != "" {
+		return map[string]any{"error": "wirelessに未コミットの別変更があります。先に保存または破棄してください"}
+	}
+
+	operations := make([][2]string, 0)
+	seenIfaces := map[string]bool{}
+	seenBands := map[string]bool{}
+	channels := make([]wifiBatchBand, 0, len(request.Bands))
+	changed := false
+	for _, change := range request.Interfaces {
+		if change.Iface == "" || seenIfaces[change.Iface] {
+			return map[string]any{"error": "Wi-Fiインターフェース指定が重複または空です"}
+		}
+		seenIfaces[change.Iface] = true
+		band, ok := wifiAPBandsFromSections(sections, order, change.Iface)
+		if !ok {
+			return map[string]any{"error": fmt.Sprintf("unknown AP interface %q", change.Iface)}
+		}
+		if !validBinaryOption(change.Hidden) || !validBinaryOption(change.Disabled) {
+			return map[string]any{"error": "hidden/disabledは0または1です"}
+		}
+		if change.Encryption != "" {
+			allowed := validEncryption2G5G
+			if band == "6G" {
+				allowed = validEncryption6G
+			}
+			if !validEncryption[change.Encryption] || !allowed[change.Encryption] {
+				return map[string]any{"error": fmt.Sprintf("encryption %q is not supported on %s", change.Encryption, band)}
+			}
+		}
+		for _, fieldValue := range []struct{ field, value string }{
+			{"ssid", change.SSID}, {"hidden", change.Hidden}, {"disabled", change.Disabled},
+			{"key", change.Password}, {"encryption", change.Encryption},
+		} {
+			field, value := fieldValue.field, fieldValue.value
+			if value != "" {
+				operations = append(operations, [2]string{change.Iface + "." + field, value})
+				changed = true
+			}
 		}
 	}
 
-	changed := false
-	set := func(field, value string) {
-		if value == "" {
-			return
+	for _, change := range request.Bands {
+		if change.Band == "" || seenBands[change.Band] {
+			return map[string]any{"error": "Wi-Fi帯域指定が重複または空です"}
 		}
-		if _, err := uci("set", "wireless."+iface+"."+field+"="+value); err == nil {
+		_, supportedBand := map[string]string{"2.4G": "2.4GHz", "5G": "5GHz", "6G": "6GHz"}[change.Band]
+		if !supportedBand {
+			return map[string]any{"error": fmt.Sprintf("unknown band %q", change.Band)}
+		}
+		seenBands[change.Band] = true
+		device, current := wifiRadioForBand(sections, order, change.Band)
+		if device == "" {
+			return map[string]any{"error": fmt.Sprintf("band %q の無線デバイスが見つかりません", change.Band)}
+		}
+		if change.Channel != "" && !validWiFiChannel(change.Channel) {
+			return map[string]any{"error": fmt.Sprintf("band %sのchannelが不正です", change.Band)}
+		}
+		prefix := htmodePrefixRe.FindString(current["htmode"])
+		if prefix == "" {
+			prefix = "NOHT"
+		}
+		chosenPrefix := prefix
+		pureB := current["pure_11b"]
+		if change.Protocol != "" {
+			chosen, ok := protocolOption(change.Band, change.Protocol)
+			if !ok {
+				return map[string]any{"error": fmt.Sprintf("%sでは通信規格%qは選べません", change.Band, change.Protocol)}
+			}
+			chosenPrefix = chosen.Prefix
+			pureB = "0"
+			if chosen.PureB {
+				pureB = "1"
+			}
+		}
+		width := htmodeWidth(current["htmode"])
+		if change.Width != "" {
+			width = change.Width
+		}
+		if change.Width != "" {
+			if chosenPrefix == "NOHT" {
+				return map[string]any{"error": "レガシー通信規格では帯域幅を変更できません"}
+			}
+			validWidth := false
+			for _, choice := range widthChoicesForProtocol(change.Band, chosenPrefix) {
+				if choice == width {
+					validWidth = true
+					break
+				}
+			}
+			if !validWidth {
+				return map[string]any{"error": fmt.Sprintf("%sでは帯域幅%qは選べません", change.Band, width)}
+			}
+		}
+		if change.Protocol != "" {
+			validWidth := false
+			for _, choice := range widthChoicesForProtocol(change.Band, chosenPrefix) {
+				if choice == width {
+					validWidth = true
+					break
+				}
+			}
+			if !validWidth {
+				width = "20"
+			}
+		}
+		newHtmode := chosenPrefix
+		coex := "0"
+		if chosenPrefix != "NOHT" {
+			newHtmode += width
+			if width == "40" {
+				coex = "1"
+			}
+		}
+		if change.Protocol != "" || change.Width != "" {
+			for _, kv := range [][2]string{
+				{device + ".htmode", newHtmode},
+				{device + ".pure_11b", pureB},
+				{device + ".ht_coex", coex},
+				{device + ".ht_extcha", "0"},
+			} {
+				operations = append(operations, kv)
+			}
+			changed = true
+		}
+		if change.Channel != "" {
+			channels = append(channels, change)
 			changed = true
 		}
 	}
-	set("ssid", ssid)
-	set("hidden", hidden)
-	set("disabled", disabled)
-	set("key", password)
-	set("encryption", encryption)
-
 	if !changed {
 		return map[string]any{"result": "noop"}
 	}
 
-	if _, err := uci("commit", "wireless"); err != nil {
-		return map[string]any{"error": fmt.Sprintf("uci commit wireless: %v", err)}
+	for _, operation := range operations {
+		if _, err := uci("set", "wireless."+operation[0]+"="+operation[1]); err != nil {
+			_, _ = uci("revert", "wireless")
+			return map[string]any{"error": "wireless設定の書き込みに失敗しました"}
+		}
 	}
-	if apply == "0" {
-		return map[string]any{"result": "ok", "applied": false}
+	if len(operations) > 0 {
+		if _, err := uci("commit", "wireless"); err != nil {
+			_, _ = uci("revert", "wireless")
+			return map[string]any{"error": fmt.Sprintf("uci commit wireless: %v", err)}
+		}
 	}
-	// 純正UIと同じ手順(Setteihozon::update_view)。
-	_ = exec.Command("knsh", "save").Run()
-	applyWifiRestart()
+	for _, change := range channels {
+		token := map[string]string{"2.4G": "2.4GHz", "5G": "5GHz", "6G": "6GHz"}[change.Band]
+		wifiDriftRecord("wifi_channel_before")
+		if _, err := exec.Command("knsh", "wlan", token, "channel", change.Channel).CombinedOutput(); err != nil {
+			// Do not echo vendor output: it could contain unrelated credentials.
+			return map[string]any{"error": fmt.Sprintf("%sのチャンネル変更に失敗しました（UCI設定は保存済み）", change.Band), "saved": len(operations) > 0}
+		}
+		wifiDriftRecord("wifi_channel_after")
+	}
+	result := finishWifiApply()
+	result["changes"] = len(request.Interfaces) + len(request.Bands)
+	return result
+}
 
-	return map[string]any{"result": "ok", "wifi_restarting": true}
+func wifiAPBandsFromSections(sections map[string]map[string]string, order []string, iface string) (string, bool) {
+	f, ok := sections[iface]
+	if !ok || f["mode"] != "ap" {
+		return "", false
+	}
+	device := f["device"]
+	for _, name := range order {
+		if name == device && sections[name]["band"] != "" {
+			return sections[name]["band"], true
+		}
+	}
+	return "", false
 }
 
 // wifiSetChannel はチャンネルを変更する。
@@ -346,15 +680,18 @@ func wifiSetChannel(band, channel, apply string) map[string]any {
 	if channel == "" {
 		return map[string]any{"error": "channel is required"}
 	}
-	if out, err := exec.Command("knsh", "wlan", token, "channel", channel).CombinedOutput(); err != nil {
-		return map[string]any{"error": fmt.Sprintf("knsh wlan %s channel %s: %v: %s", token, channel, err, strings.TrimSpace(string(out)))}
+	if !validWiFiChannel(channel) {
+		return map[string]any{"error": "channel must be a decimal value from 0 to 233"}
 	}
 	if apply == "0" {
-		return map[string]any{"result": "ok", "applied": false}
+		return map[string]any{"error": "channelの保留変更はwifi_apply_batchから送信してください"}
 	}
-	_ = exec.Command("knsh", "save").Run()
-	applyWifiRestart()
-	return map[string]any{"result": "ok", "wifi_restarting": true}
+	wifiDriftRecord("wifi_channel_before")
+	if err := exec.Command("knsh", "wlan", token, "channel", channel).Run(); err != nil {
+		return map[string]any{"error": fmt.Sprintf("knsh wlan %s channel %sに失敗しました: %v", token, channel, err)}
+	}
+	wifiDriftRecord("wifi_channel_after")
+	return finishWifiApply()
 }
 
 var htmodePrefixRe = regexp.MustCompile(`^[A-Za-z]+`)
@@ -511,9 +848,9 @@ func wifiSetBandwidth(band, width, apply string) map[string]any {
 	if apply == "0" {
 		return map[string]any{"result": "ok", "applied": false, "htmode": newHtmode}
 	}
-	_ = exec.Command("knsh", "save").Run()
-	applyWifiRestart()
-	return map[string]any{"result": "ok", "wifi_restarting": true, "htmode": newHtmode}
+	result := finishWifiApply()
+	result["htmode"] = newHtmode
+	return result
 }
 
 // wifiSetProtocol は通信規格(802.11b/g/n/ac/ax/be)を変更する。帯域幅は
@@ -593,9 +930,9 @@ func wifiSetProtocol(band, protocol, apply string) map[string]any {
 	if apply == "0" {
 		return map[string]any{"result": "ok", "applied": false, "htmode": newHtmode}
 	}
-	_ = exec.Command("knsh", "save").Run()
-	applyWifiRestart()
-	return map[string]any{"result": "ok", "wifi_restarting": true, "htmode": newHtmode}
+	result := finishWifiApply()
+	result["htmode"] = newHtmode
+	return result
 }
 
 // systemReboot は本体を再起動する。Wi-Fi設定の反映にはこれが要る

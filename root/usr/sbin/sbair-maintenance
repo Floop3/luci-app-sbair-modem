@@ -1,0 +1,336 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Floop3
+#
+# Small, recovery-friendly maintenance helper for SoftBank Air 6.
+# Keep this file BusyBox ash compatible.  In particular, this helper owns only
+# the LAN DHCP *server* and FOTA service settings; it never changes the LAN
+# DHCP client/network settings or reloads the whole network.
+
+PATH=${SBAIR_MAINTENANCE_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+export PATH
+
+BACKUP_DIR=${SBAIR_MAINTENANCE_BACKUP_DIR:-/root/sbair-backups}
+DHCP_CONFIG=${SBAIR_MAINTENANCE_DHCP_CONFIG:-/etc/config/dhcp}
+FOTA_CONFIG=${SBAIR_MAINTENANCE_FOTA_CONFIG:-/etc/config/fota}
+FOTA_INIT=${SBAIR_MAINTENANCE_FOTA_INIT:-/etc/init.d/kn_fotad}
+DNSMASQ_INIT=${SBAIR_MAINTENANCE_DNSMASQ_INIT:-/etc/init.d/dnsmasq}
+NETMODE_HELPER=${SBAIR_MAINTENANCE_NETMODE:-/usr/sbin/sbair-netmode}
+RC_DIR=${SBAIR_MAINTENANCE_RC_DIR:-/etc/rc.d}
+FOTA_PROCESS=${SBAIR_MAINTENANCE_FOTA_PROCESS:-kn_fotad}
+WAIT_SECONDS=${SBAIR_MAINTENANCE_WAIT_SECONDS:-10}
+
+say_error() {
+	printf 'result=error\nerror=%s\n' "$1"
+}
+
+uci_get() {
+	uci -q get "$1" 2>/dev/null || true
+}
+
+is_true() {
+	case "$1" in
+		1|true|yes|on|enabled) return 0;;
+		*) return 1;;
+	esac
+}
+
+bool_value() {
+	if is_true "$1"; then
+		printf '1\n'
+	else
+		printf '0\n'
+	fi
+}
+
+process_running() {
+	local name
+	name=$1
+	if command -v pidof >/dev/null 2>&1 && pidof "$name" >/dev/null 2>&1; then
+		return 0
+	fi
+	command -v ps >/dev/null 2>&1 || return 1
+	ps w 2>/dev/null | awk -v n="$name" '
+		$0 ~ "(^|[ /])" n "([ ]|$)" { found = 1 }
+		END { exit(found ? 0 : 1) }'
+}
+
+process_state() {
+	if process_running "$1"; then
+		printf 'running\n'
+	else
+		# pidof/ps being unavailable is not distinguishable from a stopped
+		# process on every vendor image.  The status remains useful either way.
+		printf 'stopped\n'
+	fi
+}
+
+listener() {
+	local proto port
+	proto=$1
+	port=$2
+	command -v netstat >/dev/null 2>&1 || return 1
+	if [ "$proto" = tcp ]; then
+		netstat -lnpt 2>/dev/null
+	else
+		netstat -lnpu 2>/dev/null
+	fi | awk -v p="$port" '
+		NR > 1 && ($4 ~ (":" p "$" ) || $4 ~ ("\\." p "$")) {
+			print $4
+			exit
+		}'
+}
+
+listener_state() {
+	if [ -n "$(listener "$1" "$2")" ]; then
+		printf '1\n'
+	else
+		printf '0\n'
+	fi
+}
+
+listener_scope() {
+	local value
+	value=$(listener "$1" "$2")
+	[ -n "$value" ] && printf '%s\n' "$value" || printf 'none\n'
+}
+
+port53_state() {
+	if [ "$(listener_state tcp 53)" = 1 ] || [ "$(listener_state udp 53)" = 1 ]; then
+		printf '1\n'
+	else
+		printf '0\n'
+	fi
+}
+
+autostart_state() {
+	local link
+	for link in "$RC_DIR"/S*kn_fotad; do
+		[ -e "$link" ] || [ -L "$link" ] && { printf 'enabled\n'; return; }
+	done
+	printf 'disabled\n'
+}
+
+netmode_field() {
+	local key output
+	key=$1
+	[ -x "$NETMODE_HELPER" ] || return 1
+	output=$($NETMODE_HELPER show 2>/dev/null) || return 1
+	printf '%s\n' "$output" | awk -F= -v k="$key" '$1 == k { print substr($0, index($0, "=") + 1); exit }'
+}
+
+pending_value() {
+	local pending
+	pending=$(uci_get sbair.bridge.pending_id)
+	[ -n "$pending" ] && printf '1\n' || printf '0\n'
+}
+
+managed_ap() {
+	[ "$(uci_get sbair.bridge.managed)" = 1 ] &&
+	[ "$(uci_get sbair.bridge.mode)" = ap ]
+}
+
+maintenance_write_allowed() {
+	if [ "$(pending_value)" = 1 ]; then
+		say_error 'Safe Applyの接続モード変更が保留中です。完了またはロールバック後に再試行してください。'
+		return 1
+	fi
+	return 0
+}
+
+backup_config() {
+	local source prefix stamp destination n
+	source=$1
+	prefix=$2
+	[ -f "$source" ] || {
+		say_error "バックアップ対象がありません: $source"
+		return 1
+	}
+	mkdir -p "$BACKUP_DIR" 2>/dev/null || {
+		say_error "バックアップディレクトリを作成できません: $BACKUP_DIR"
+		return 1
+	}
+	chmod 700 "$BACKUP_DIR" 2>/dev/null || true
+	stamp=$(date +%Y%m%d-%H%M%S 2>/dev/null || printf 'unknown')
+	destination="$BACKUP_DIR/$prefix.$stamp.$$"
+	n=0
+	while [ -e "$destination" ]; do
+		n=$((n + 1))
+		destination="$BACKUP_DIR/$prefix.$stamp.$$.$n"
+	done
+	cp -p "$source" "$destination" 2>/dev/null || {
+		say_error "設定バックアップに失敗しました: $source"
+		return 1
+	}
+	printf '%s\n' "$destination"
+}
+
+dhcp_status() {
+	local ignore managed mode owner guard ra dhcpv6 ndp
+	ignore=$(uci_get dhcp.lan.ignore)
+	managed=$(uci_get sbair.bridge.managed)
+	mode=$(uci_get sbair.bridge.mode)
+	[ "$managed" = 1 ] && [ "$mode" = ap ] && owner=netmode-ap || owner=manual
+	guard=$(netmode_field dhcp.guard_active 2>/dev/null || true)
+	[ -n "$guard" ] || guard=unknown
+	ra=$(uci_get dhcp.lan.ra); [ -n "$ra" ] || ra=-
+	dhcpv6=$(uci_get dhcp.lan.dhcpv6); [ -n "$dhcpv6" ] || dhcpv6=-
+	ndp=$(uci_get dhcp.lan.ndp); [ -n "$ndp" ] || ndp=-
+
+	printf 'result=ok\n'
+	printf 'dhcp_server.uci_ignore=%s\n' "${ignore:--}"
+	if [ "$ignore" = 1 ]; then
+		printf 'dhcp_server.enabled=0\n'
+	else
+		printf 'dhcp_server.enabled=1\n'
+	fi
+	printf 'dhcp_server.udp67_listening=%s\n' "$(listener_state udp 67)"
+	printf 'dhcp_server.udp67_scope=%s\n' "$(listener_scope udp 67)"
+	printf 'dhcp_server.dnsmasq=%s\n' "$(process_state dnsmasq)"
+	printf 'dhcp_server.port53_listening=%s\n' "$(port53_state)"
+	printf 'dhcp_server.port53_tcp_scope=%s\n' "$(listener_scope tcp 53)"
+	printf 'dhcp_server.port53_udp_scope=%s\n' "$(listener_scope udp 53)"
+	printf 'dhcp_server.odhcpd=%s\n' "$(process_state odhcpd)"
+	printf 'dhcp_server.ra=%s\n' "$ra"
+	printf 'dhcp_server.dhcpv6=%s\n' "$dhcpv6"
+	printf 'dhcp_server.ndp=%s\n' "$ndp"
+	printf 'dhcp_server.owner=%s\n' "$owner"
+	printf 'dhcp_server.guard_active=%s\n' "$guard"
+	printf 'dhcp_server.pending=%s\n' "$(pending_value)"
+}
+
+fota_status() {
+	local enabled provision respawn
+	enabled=$(uci_get fota.config.enabled); [ -n "$enabled" ] || enabled=-
+	provision=$(uci_get fota.provision.enabled); [ -n "$provision" ] || provision=-
+	respawn=$(uci_get fota.config.respawn); [ -n "$respawn" ] || respawn=-
+	printf 'fota.config_enabled=%s\n' "$enabled"
+	printf 'fota.provision_enabled=%s\n' "$provision"
+	printf 'fota.config_respawn=%s\n' "$respawn"
+	printf 'fota.kn_fotad=%s\n' "$(process_state "$FOTA_PROCESS")"
+	printf 'fota.autostart=%s\n' "$(autostart_state)"
+}
+
+status_command() {
+	dhcp_status
+	fota_status
+}
+
+set_uci_value() {
+	uci -q set "$1=$2" >/dev/null 2>&1
+}
+
+commit_uci() {
+	uci -q commit "$1" >/dev/null 2>&1
+}
+
+dhcp_action() {
+	local requested target current backup udp
+	requested=$1
+	target=$(bool_value "$requested")
+	maintenance_write_allowed || return 1
+	if [ "$target" = 1 ] && managed_ap; then
+		say_error '接続モード「AP / Bridge」がLAN DHCPサーバーを管理しています。APモード中はDHCPサーバーを有効化できません。'
+		return 1
+	fi
+	current=$(uci_get dhcp.lan.ignore)
+	if [ "$target" = 1 ]; then
+		[ "$current" = 0 ] || {
+			backup=$(backup_config "$DHCP_CONFIG" dhcp) || return 1
+			set_uci_value dhcp.lan.ignore 0 || { say_error 'dhcp.lan.ignore=0 を保存できません'; return 1; }
+			commit_uci dhcp || { say_error 'DHCP設定をcommitできません'; return 1; }
+			"$DNSMASQ_INIT" restart >/dev/null 2>&1 || { say_error 'dnsmasqを再起動できません'; return 1; }
+			printf 'result=enabled\nbackup=%s\n' "$backup"
+			udp=$(listener_state udp 67)
+			printf 'verification.uci_ignore=%s\nverification.udp67_listening=%s\n' "$(uci_get dhcp.lan.ignore)" "$udp"
+			[ "$udp" = 1 ] || printf 'warning=DHCPサーバーを有効化しましたが、UDP/67を確認できません。\n'
+			return 0
+		}
+		printf 'result=already_enabled\nverification.uci_ignore=0\nverification.udp67_listening=%s\n' "$(listener_state udp 67)"
+		return 0
+	fi
+
+	[ "$current" = 1 ] || {
+		backup=$(backup_config "$DHCP_CONFIG" dhcp) || return 1
+		set_uci_value dhcp.lan.ignore 1 || { say_error 'dhcp.lan.ignore=1 を保存できません'; return 1; }
+		commit_uci dhcp || { say_error 'DHCP設定をcommitできません'; return 1; }
+		"$DNSMASQ_INIT" restart >/dev/null 2>&1 || { say_error 'dnsmasqを再起動できません'; return 1; }
+		printf 'result=disabled\nbackup=%s\n' "$backup"
+		udp=$(listener_state udp 67)
+		printf 'verification.uci_ignore=%s\nverification.udp67_listening=%s\n' "$(uci_get dhcp.lan.ignore)" "$udp"
+		[ "$udp" = 0 ] || printf 'warning=DHCPサーバーを無効化しましたが、UDP/67がまだ待受中です。\n'
+		return 0
+	}
+	printf 'result=already_disabled\nverification.uci_ignore=1\nverification.udp67_listening=%s\n' "$(listener_state udp 67)"
+}
+
+fota_action() {
+	local requested target enabled provision running autostart backup respawn_after
+	requested=$1
+	target=$(bool_value "$requested")
+	maintenance_write_allowed || return 1
+	enabled=$(uci_get fota.config.enabled)
+	provision=$(uci_get fota.provision.enabled)
+	running=$(process_state "$FOTA_PROCESS")
+	autostart=$(autostart_state)
+	if [ "$target" = 0 ]; then
+		if [ "$enabled" = 0 ] && [ "$provision" = 0 ] && [ "$running" = stopped ] && [ "$autostart" = disabled ]; then
+			printf 'result=already_disabled\nfota.config_respawn=%s\n' "$(uci_get fota.config.respawn)"
+			return 0
+		fi
+		backup=$(backup_config "$FOTA_CONFIG" fota) || return 1
+		set_uci_value fota.config.enabled 0 || { say_error 'fota.config.enabled=0 を保存できません'; return 1; }
+		set_uci_value fota.provision.enabled 0 || { say_error 'fota.provision.enabled=0 を保存できません'; return 1; }
+		commit_uci fota || { say_error 'FOTA設定をcommitできません'; return 1; }
+		"$FOTA_INIT" stop >/dev/null 2>&1 || { say_error 'kn_fotadを停止できません'; return 1; }
+		"$FOTA_INIT" disable >/dev/null 2>&1 || { say_error 'kn_fotadの自動起動を無効化できません'; return 1; }
+		sleep "$WAIT_SECONDS"
+		respawn_after=$(process_state "$FOTA_PROCESS")
+		printf 'result=disabled\nbackup=%s\nfota.config_enabled=%s\nfota.provision_enabled=%s\nfota.config_respawn=%s\n' \
+			"$backup" "$(uci_get fota.config.enabled)" "$(uci_get fota.provision.enabled)" "$(uci_get fota.config.respawn)"
+		printf 'fota.kn_fotad=%s\nfota.autostart=%s\n' "$respawn_after" "$(autostart_state)"
+		[ "$respawn_after" = stopped ] || printf 'warning=kn_fotadが停止後も再起動しました。respawn設定は変更していません。\n'
+		return 0
+	fi
+
+	if [ "$enabled" = 1 ] && [ "$provision" = 1 ] && [ "$running" = running ] && [ "$autostart" = enabled ]; then
+		printf 'result=already_enabled\nfota.config_enabled=1\nfota.provision_enabled=1\nfota.config_respawn=%s\nfota.kn_fotad=running\nfota.autostart=enabled\n' "$(uci_get fota.config.respawn)"
+		return 0
+	fi
+	backup=$(backup_config "$FOTA_CONFIG" fota) || return 1
+	set_uci_value fota.config.enabled 1 || { say_error 'fota.config.enabled=1 を保存できません'; return 1; }
+	set_uci_value fota.provision.enabled 1 || { say_error 'fota.provision.enabled=1 を保存できません'; return 1; }
+	commit_uci fota || { say_error 'FOTA設定をcommitできません'; return 1; }
+	"$FOTA_INIT" enable >/dev/null 2>&1 || { say_error 'kn_fotadの自動起動を有効化できません'; return 1; }
+	"$FOTA_INIT" start >/dev/null 2>&1 || { say_error 'kn_fotadを起動できません'; return 1; }
+	running=$(process_state "$FOTA_PROCESS")
+	autostart=$(autostart_state)
+	printf 'result=enabled\nbackup=%s\nfota.config_enabled=%s\nfota.provision_enabled=%s\nfota.config_respawn=%s\nfota.kn_fotad=%s\nfota.autostart=%s\n' \
+		"$backup" "$(uci_get fota.config.enabled)" "$(uci_get fota.provision.enabled)" "$(uci_get fota.config.respawn)" "$running" "$autostart"
+	[ "$running" = running ] || printf 'warning=kn_fotadを起動しましたが、稼働中であることを確認できません。\n'
+	[ "$autostart" = enabled ] || printf 'warning=kn_fotadを有効化しましたが、自動起動リンクを確認できません。\n'
+}
+
+case "${1:-}" in
+	status)
+		status_command
+		;;
+	dhcp-server)
+		case "${2:-}" in
+			enable) dhcp_action 1;;
+			disable) dhcp_action 0;;
+			*) say_error 'usage: sbair-maintenance dhcp-server enable|disable'; exit 2;;
+		esac
+		;;
+	fota)
+		case "${2:-}" in
+			enable) fota_action 1;;
+			disable) fota_action 0;;
+			*) say_error 'usage: sbair-maintenance fota enable|disable'; exit 2;;
+		esac
+		;;
+	*)
+		say_error 'usage: sbair-maintenance status|dhcp-server enable|disable|fota enable|disable'
+		exit 2
+		;;
+esac

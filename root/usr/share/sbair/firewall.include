@@ -1,0 +1,42 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 syado
+#
+# fw3 script include for the AP-mode DHCP packet guard. This file is owned by
+# the package and is run again on every firewall reload/restart.
+
+PATH=${SBAIR_FIREWALL_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+BRIDGE=br-lan
+
+guard_present() {
+	command -v iptables >/dev/null 2>&1 || return 1
+	iptables -C OUTPUT -o "$BRIDGE" -p udp --sport 67 --dport 68 -j DROP >/dev/null 2>&1
+}
+
+guard_remove() {
+	command -v iptables >/dev/null 2>&1 || return 0
+	while guard_present; do
+		iptables -D OUTPUT -o "$BRIDGE" -p udp --sport 67 --dport 68 -j DROP >/dev/null 2>&1 || break
+	done
+}
+
+drift_snapshot() {
+	[ -x /usr/bin/sbair-modem ] || return 0
+	/usr/bin/sbair-modem wifi-drift snapshot "$1" >/dev/null 2>&1 || true
+}
+
+drift_snapshot firewall_reload_before
+
+if [ "$(uci -q get sbair.bridge.mode 2>/dev/null)" = ap ] &&
+	[ "$(uci -q get sbair.bridge.managed 2>/dev/null)" = 1 ]; then
+	command -v iptables >/dev/null 2>&1 || exit 0
+	if ! guard_present; then
+		iptables -I OUTPUT 1 -o "$BRIDGE" -p udp --sport 67 --dport 68 -j DROP >/dev/null 2>&1 || exit 0
+	fi
+else
+	guard_remove
+fi
+
+drift_snapshot firewall_reload_after
+
+exit 0

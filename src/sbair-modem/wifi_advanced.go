@@ -88,10 +88,12 @@ func wifiEnabledStatus() map[string]any {
 func wifiEnabledSet(on string) map[string]any {
 	ensureKnosSection("network")
 	val := boolArg(on)
+	wifiDriftRecord("wifi_enabled_before")
 	if out, err := knshOutput("wlan", "function", "set", val); err != nil {
 		return map[string]any{"error": fmt.Sprintf("knsh wlan function set: %v: %s", err, out)}
 	}
 	commitKnos()
+	wifiDriftRecord("wifi_enabled_after")
 	return map[string]any{"result": "ok", "enabled": val == "1"}
 }
 
@@ -114,10 +116,12 @@ func bandsteeringStatus() map[string]any {
 func bandsteeringSet(on string) map[string]any {
 	ensureKnosSection("network")
 	val := boolArg(on)
+	wifiDriftRecord("bandsteering_before")
 	if out, err := knshOutput("wlan", "bandsteering", val); err != nil {
 		return map[string]any{"error": fmt.Sprintf("knsh wlan bandsteering: %v: %s", err, out)}
 	}
 	commitKnos()
+	wifiDriftRecord("bandsteering_after")
 	return map[string]any{"result": "ok", "enabled": val == "1"}
 }
 

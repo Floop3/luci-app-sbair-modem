@@ -15,9 +15,9 @@
 // 2026-08-10にモーダル方式から変更)・チャンネル・帯域幅・通信規格のどれを触っても、
 // その場ではサーバへ送らずこの画面のローカル状態(pendingIface/pendingBand)に
 // 溜めておくだけにする。画面上部の「変更を適用」ボタンを押した時に初めて、
-// 溜まった変更をすべて apply="0"(反映を保留)で送ってから、最後に1回だけ
-// wifi_apply(knsh save + knsh wlan restart)を呼ぶ。これで複数箇所を
-// まとめて変えても、Wi-Fiが数秒切断される瞬間は1回だけで済む
+// すべての変更を1本のwifi_apply_batchへ送り、検証・保存・再起動開始までを
+// 1回のトランザクションとして扱う。これで複数箇所をまとめて変えても、
+// Wi-Fiが数秒切断される瞬間は1回だけで済む
 // (2026-08-10、/lib/wifi/mtwifi.lua の解析で「保存だけでは反映されず、
 // restartでドライバを再読み込みすれば本体再起動なしで反映できる」と判明した後の対応。
 // docs/KNSH_COMMAND_AUDIT.md §6-4参照)。
@@ -30,24 +30,9 @@
 'require tools.sbair as sbair';
 
 var callWifiStatus = rpc.declare({ object: 'sbair', method: 'wifi_status' });
-var callWifiSet = rpc.declare({
-	object: 'sbair', method: 'wifi_set',
-	params: [ 'iface', 'ssid', 'hidden', 'disabled', 'password', 'encryption', 'apply' ]
+var callWifiApplyBatch = rpc.declare({
+	object: 'sbair', method: 'wifi_apply_batch', params: [ 'changes' ]
 });
-var callWifiSetChannel = rpc.declare({
-	object: 'sbair', method: 'wifi_set_channel',
-	params: [ 'band', 'channel', 'apply' ]
-});
-var callWifiSetBandwidth = rpc.declare({
-	object: 'sbair', method: 'wifi_set_bandwidth',
-	params: [ 'band', 'width', 'apply' ]
-});
-var callWifiSetProtocol = rpc.declare({
-	object: 'sbair', method: 'wifi_set_protocol',
-	params: [ 'band', 'protocol', 'apply' ]
-});
-var callWifiApply = rpc.declare({ object: 'sbair', method: 'wifi_apply' });
-var callReboot = rpc.declare({ object: 'sbair', method: 'system_reboot' });
 
 var bandLabel = { '2.4G': '2.4GHz', '5G': '5GHz', '6G': '6GHz' };
 
@@ -272,33 +257,19 @@ function applyBar(pendingCount, onApply, onDiscard) {
 	]);
 }
 
-function manualRebootBox(onReboot) {
-	return E('div', { 'style': 'margin:.5em 0;opacity:.8' }, [
-		E('span', {}, '変更の適用時はWi-Fiドライバだけを再読み込みします(数秒切断されます。本体再起動は不要)。'),
-		' ',
-		E('span', {}, 'それでも反映されない場合(SSIDの追加/削除時など)は、'),
-		E('button', {
-			'class': 'cbi-button cbi-button-neutral',
-			'style': 'margin-left:.3em',
-			'click': onReboot
-		}, '本体を再起動'),
-		E('span', {}, ' してください。')
-	]);
-}
-
 function render(data, opts) {
 	data = data || {};
 	opts = opts || {};
 	var body = [];
 
+	body.push(sbair.softBrickWarning('wifi'));
 	body.push(E('p', { 'style': 'opacity:.8' },
 		'この機体の無線ドライバ(mt_wifi)は OpenWrt 標準の Network → Wireless 画面に対応していないため、' +
 		'ここで直接編集します。'));
-	body.push(manualRebootBox(opts.onReboot));
 	body.push(applyBar(opts.pendingCount, opts.onApply, opts.onDiscard));
 
 	body.push(sbair.section('Wi-Fi', [ ifaceTable(data.ifaces, opts.pendingIface, opts.onIfaceChange) ]));
-	body.push(sbair.section('通信規格・チャンネル・帯域幅(帯域ごと・全SSID共通)', [
+	body.push(sbair.section('通信規格・チャンネル・帯域幅（UCI設定値。実動作は「Wi-Fi > 診断」で確認）', [
 		channelTable(data.radios, opts.pendingBand, opts.onBandChange)
 	]));
 	body.push(sbair.errorBox(data.error ? [ data.error ] : null));
@@ -332,8 +303,7 @@ return view.extend({
 				onIfaceChange: onIfaceChange,
 				onBandChange: onBandChange,
 				onApply: applyAll,
-				onDiscard: discardAll,
-				onReboot: doReboot
+				onDiscard: discardAll
 			}));
 		};
 
@@ -368,56 +338,40 @@ return view.extend({
 			redraw();
 		}
 
-		// 保留中の変更をすべて apply="0" で送ってから、最後に1回だけ
-		// wifi_apply(knsh save + knsh wlan restart)を呼ぶ。
+		// 保留中の変更をサーバー側で一度に検証・保存・反映する。
 		function applyAll() {
 			var ifaceKeys = Object.keys(self.pendingIface);
 			var bandKeys = Object.keys(self.pendingBand);
 			if (ifaceKeys.length === 0 && bandKeys.length === 0)
 				return;
 
-			var tasks = [];
+			var changes = { interfaces: [], bands: [] };
 			ifaceKeys.forEach(function(iface) {
 				var p = self.pendingIface[iface];
-				tasks.push(callWifiSet(iface, p.ssid, p.hidden, p.disabled, p.password, p.encryption, '0'));
+				changes.interfaces.push({
+					iface: iface, ssid: p.ssid || '', hidden: p.hidden || '',
+					disabled: p.disabled || '', password: p.password || '',
+					encryption: p.encryption || ''
+				});
 			});
 			bandKeys.forEach(function(band) {
 				var p = self.pendingBand[band];
-				if (p.protocol !== undefined)
-					tasks.push(callWifiSetProtocol(band, p.protocol, '0'));
-				if (p.channel !== undefined)
-					tasks.push(callWifiSetChannel(band, p.channel, '0'));
-				if (p.bandwidth !== undefined)
-					tasks.push(callWifiSetBandwidth(band, p.bandwidth, '0'));
+				changes.bands.push({
+					band: band, protocol: p.protocol || '', channel: p.channel || '',
+					bandwidth: p.bandwidth || ''
+				});
 			});
 
-			Promise.all(tasks).then(function(results) {
-				var err = results.map(function(r) { return r && r.error; }).filter(Boolean)[0];
-				if (err) {
-					ui.addNotification(null, E('p', {}, err), 'danger');
+			callWifiApplyBatch(JSON.stringify(changes)).then(function(res) {
+				if (res && res.error) {
+					ui.addNotification(null, E('p', {}, res.error), 'danger');
 					return;
 				}
-				return callWifiApply().then(function(res) {
-					if (res && res.error) {
-						ui.addNotification(null, E('p', {}, res.error), 'danger');
-						return;
-					}
-					ui.addNotification(null, E('p', {},
-						'設定を反映しました。Wi-Fiが数秒切断・再接続されます。'), 'info');
-					return reload();
-				});
+				ui.addNotification(null, E('p', {},
+					'設定を保存し、Wi-Fi再起動を開始しました。数秒切断・再接続されます。'), 'info');
+				return reload();
 			}).catch(function(err) {
 				ui.addNotification(null, E('p', {}, String(err)), 'danger');
-			});
-		}
-
-		function doReboot() {
-			if (!confirm('本体を再起動します。よろしいですか?(Wi-Fi・LANとも一時的に切断されます)'))
-				return;
-			callReboot().then(function() {
-				ui.addNotification(null, E('p', {}, '再起動しています。1〜2分後にページを再読み込みしてください。'), 'info');
-			}).catch(function(err) {
-				ui.addNotification(null, E('p', {}, String(err)), 'warning');
 			});
 		}
 

@@ -1,0 +1,36 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Floop3
+#
+# Monitor-only scheduler. Every snapshot is read-only. This is intentionally
+# opt-in and deliberately low frequency: a snapshot hashes vendor .dat files
+# and invokes iw/hostapd_cli/iwinfo, so a short polling interval can amplify
+# the vendor firmware's single-core contention.
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+snapshot() {
+	/usr/bin/sbair-modem wifi-drift snapshot >/dev/null 2>&1 || true
+}
+
+case "${1:-}" in
+	--daemon)
+		started=$(date +%s 2>/dev/null || printf '0\n')
+		for delay in 0 120 300; do
+			while :; do
+				now=$(date +%s 2>/dev/null || printf '%s\n' "$started")
+				[ $((now - started)) -ge "$delay" ] && break
+				sleep 5
+			done
+			snapshot
+		done
+		while :; do
+			sleep 120
+			snapshot
+		done
+		;;
+	*)
+		printf '%s\n' 'usage: sbair-wifidrift --daemon' >&2
+		exit 2
+		;;
+esac

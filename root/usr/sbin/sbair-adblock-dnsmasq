@@ -1,0 +1,7 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Keep DNAT fail-closed if the dedicated dnsmasq exits unexpectedly.
+/usr/sbin/dnsmasq -C /etc/sbair/adblock-dnsmasq.conf -k
+status=$?
+/usr/bin/sbair-modem adblock-stop >/dev/null 2>&1 || true
+exit "$status"

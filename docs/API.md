@@ -1,15 +1,10 @@
 <!-- SPDX-License-Identifier: MIT -->
 # ubus API と LuCI 画面
 
-このリポジトリは**アプリの仕様**だけを扱う。
-モデムそのものの挙動(AT の効き方、ファームウェアの癖、実測値)は
-[sbair6-rs](https://github.com/soralis0912/sbair6-rs) の `docs/` にある。
-
-| 参照先 | |
-|---|---|
-| [AT.md](https://github.com/soralis0912/sbair6-rs/blob/main/docs/AT.md) | AT 経路 / バンド / SIM ロック / IMS / SMS / APN の実測 |
-| [ESIM_AT.md](https://github.com/soralis0912/sbair6-rs/blob/main/docs/ESIM_AT.md) | eUICC の APDU 経路と SIM マッピング |
-| [SIM_STATUS.md](https://github.com/soralis0912/sbair6-rs/blob/main/docs/SIM_STATUS.md) | 事業者ごとの開通条件 |
+このリポジトリは、アプリ本体の仕様と、SoftBank Air 6向け実装の安全境界を扱う。
+ATコマンドの応答、ファームウェア固有の挙動、通信事業者ごとの開通条件などは、
+使用する機体・回線・ファームウェアの仕様を別途確認すること。ここに記載していない
+実機依存の挙動を、本アプリのAPI契約として扱わない。
 
 ---
 
@@ -68,6 +63,163 @@ sbair call <method>     → 引数を JSON で stdin、結果を stdout
 | `ims_set` | `on` | IMS の切替 |
 | `modem_reset` | — | モデムのリセットを**開始**する(すぐ返る) |
 | `modem_reset_status` | — | 進捗。**AT に触らない** |
+| `netmode_status` | — | 接続モード、DHCP/UDP67、Bridge、Cellular経路、Wi-Fi実状態 |
+| `netmode_netdev_status` | — | ネットワーク > 診断で使う、有線 / USB Host Ethernet候補とKernel能力の読み取り専用診断。汎用USB機器一覧は返すが、専用画面では表示しない |
+| `netmode_get_config` | — | `/etc/config/sbair` の接続モード設定 |
+| `wifi_drift_status` | — | UCI / vendor persistent / runtimeのMonitor only状態と差分 |
+| `wifi_drift_logs` | — | 直近の安全化済みイベント/相関ログ |
+| `wifi_drift_set` | `enabled` | Monitor daemonのON/OFF。明示操作時のみUCIを変更 |
+| `wifi_drift_mark_good` | — | 現在の安全なmetadataをKnown-goodとして保存 |
+| `wifi_drift_save_test` | — | 明示確認後に`knsh save`だけ実行し前後を比較。restartしない |
+| `wifi_drift_restart_test` | — | 明示確認後に`knsh wlan restart`を実行しruntimeを比較 |
+| `netmode_set_config` | `proto` `ipaddr` `netmask` `gateway` `dns` `fallback_enabled` `fallback_ip` `fallback_netmask` `fallback_timeout` | 非推奨互換API。draftだけを保存し、ネットワークは変更しない |
+| `netmode_apply` | `mode` (`sim` / `ap`) と管理IP/Fallback一式 | Safe Applyを開始。APの管理経路が実機側で正常と確認できれば自動確定し、確認できない場合だけ120秒以内のconfirmが必要 |
+| `netmode_confirm` | — | 保留中の変更を確定 |
+| `netmode_rollback` | — | 保留中の変更を旧設定へ戻す |
+| `netmode_repair` | — | APモードのDHCP、IPv6配布、Cellular経路、Fallbackを補正 |
+| `maintenance_status` | — | LAN DHCPサーバーとOTA/FOTAの実状態。読み取り専用 |
+| `dhcp_server_set` | `enabled` (boolean) | `dhcp.lan.ignore`だけを変更し、dnsmasqだけを再起動。DHCPクライアント設定は変更しない |
+| `fota_set` | `enabled` (boolean) | `fota.config.enabled` / `fota.provision.enabled` とkn_fotadの停止・自動起動だけを管理。`respawn`は変更しない |
+| `usb_status` | — | Air 6 に接続された USB host device / interface の読み取り専用インベントリ。既存のドライバ操作欄は無効 |
+| `usb_nic_status` | — | 任意の USB CDC-NCM gadget bundle、profile、UDC、ConfigFS、`usb0`、管理経路、preflight の構造化状態 |
+| `usb_nic_enable` | `ack` (boolean) | explicit acknowledgement 後に、固定 topology の実験的 USB gadget を有効化。profile / hash / kernel / UDC 等の安全ゲートを再検証 |
+| `usb_nic_disable` | — | app-owned の exact gadget topology だけを限定 cleanup。未知の ConfigFS object や vendor gadget は削除しない |
+
+`dhcp_server_set` の `enabled` は、Air 6がLAN端末へ配るDHCPサーバーの有効化です。
+Air 6自身が親ルーターから管理IPを取得するDHCPクライアント
+（`network.lan.*` / `management_proto`）とは別で、LANサービス画面からは変更しません。
+接続モードがmanaged AP中、またはSafe Applyがpending中の書き込みは拒否されます。
+
+## 接続モード (AP / Bridge)
+
+接続モードの設定は `dhcp.lan.ignore` だけでは判定せず、専用の
+`/etc/config/sbair` に保持する。初回導入時は `dhcp.lan.ignore` からAPを推測せず、
+明示的な適用までネットワークを変更しない。`root/usr/sbin/sbair-netmode` が、
+既存の `br-lan` とWi-Fi設定を変更せずにL3/DHCPだけを管理する。
+
+```text
+config bridge 'bridge'
+	option mode 'ap'
+	option management_proto 'static'
+	option ipaddr ''
+	option netmask ''
+	option gateway ''
+	option dns ''
+	option oem_baseline_ready '0'
+	option ap_dhcp_enabled '1'
+	option dhcp_server '0'
+	option cellular_wan '0'
+	option fallback_enabled '1'
+	option fallback_ip '192.168.3.1'
+	option fallback_netmask '255.255.255.0'
+	option fallback_timeout '15'
+```
+
+`ap_dhcp_enabled=1` が既定値で、APの管理IP DHCPクライアントを選択できる。ただしこれは
+非常に高いリスクを伴うネットワーク変更で、適用に失敗すると全てのネットワーク接続を失い、
+ソフトブリックしてUART復旧が必要になるおそれがある。UARTなどの復旧手段を確保できない場合は
+選択・適用しないこと。Safe Applyの自動ロールバックもあらゆる設定失敗からの復旧を保証しない。
+`ap_dhcp_enabled=0` にすると安全のため固定IPだけを受け付ける。SIMモードのDHCPには影響しない。
+
+AP / Bridgeの固定IP設定では、`ipaddr`、`netmask`、`gateway`、`dns` の空欄は削除や
+`192.168.3.1`への置換を意味せず、初回の管理開始前に保存した純正の論理
+`network.lan.ipaddr` / `netmask` / `gateway` / `dns` を継承する。必須の固定IPまたは
+ネットマスクを純正設定からも解決できない場合は、ネットワーク変更前に拒否する。
+明示指定と純正値の継承は、`netmode_get_config` の `effective.*_source` でそれぞれ
+`明示指定` / `純正設定を継承` と表示する。純正ベースラインは一度だけ保存し、Safe Applyの
+トランザクションスナップショットやFallback IPとは別管理する。
+
+`netmode_get_config` は、入力値を `ipaddr` / `netmask` / `gateway` / `dns` に、保存した
+純正値を `oem.*` に、解決後に適用する値を `effective.*` に返す。`fallback_ip` は
+DHCPクライアントの取得失敗時だけ使う復旧用アドレスで、通常の固定IP解決には使わない。
+
+APモードでは `dhcp.lan.ignore=1`、RA / DHCPv6 / NDP無効、Cellular WANの
+自動起動停止を維持する。加えて、Air 6自身から `br-lan` へ出るIPv4 DHCP
+OFFER/ACK (`UDP 67 -> 68`) をiptablesでDROPするfail-closed guardを保持する。
+`netmode_status.dhcp_server.udp67_listening` はシステム全体の待受観測
+（`udp67_scope=system`）であり、別interfaceのlistenerだけでAPを危険判定しない。
+APの安全性は `dhcp.lan.ignore` と、`br-lan`向けのpacket guardの有効性で判定する。
+DHCP clientが15秒以内に管理IPを取得できない場合だけ、ARP probe後にFallback IPを
+`br-lan` へ追加する。上流DHCPが `bound` / `renew` になればFallbackは削除される。
+`network.lan1` の `172.16.255.254` は変更しない。SIMモード復帰時はdnsmasqを再起動し、
+UDP/67がLISTENしたことを確認する。
+
+Wi-Fi、MLO、Band Steering、SSID、チャンネル、帯域幅はこの機能の補正対象外である。
+有線 / USBの診断は `sbair-modem netmode netdev-status` または
+`netmode_netdev_status` で参照できる。sysfs、`network.wan` のプロトコル / device、
+必要なら `ubus network.interface.wan status` だけを根拠にし、自動でWAN/LAN、bridge、
+USB Host Ethernetやkernel moduleを割り当てたり変更したりしない。USBの `bus_speed` は
+実際にsysfsが報告した交渉速度であり、ポートの外観や「USB 3」と書かれた端子だけから
+USB 3対応とは表示しない。`usb_controllers` は実際のhost controllerの詳細ではなく、
+`/sys/bus/usb/devices/usbN` のUSB bus / root hubを表示する。USB network candidateは
+descriptor classだけでなく、vendor-specific classでも実際にLinux netdevがbind済みなら
+候補として扱い、未bindのvendor-specific deviceは `unbound` とも捏造しない。診断RPCの
+取得失敗は診断欄だけに表示し、接続モードの表示・Safe Apply・Confirm・Rollback・Repairは
+継続して利用できる。
+
+能力表示の根拠は、公式に確認できた機体情報、kernel / sysfsの技術的観測、値を取得できない
+`unknown` を混同しない。公式情報や実機で裏付けられない値は能力として断定しない。
+
+## USB Gadget（CDC-NCM NIC）
+
+`usb_status` が扱う「Air 6 の USB Host に接続された device」のインベントリと、
+`usb_nic_*` が扱う「Air 6 自身を USB Gadget にする」機能は別系統である。
+後者は `extras/usb-nic/` の任意 bundle が存在しない限り有効化できず、module の load、
+ConfigFS、UDC bind、`usb0`、LAN/WAN/bridge、firewall、Wi-Fi、自動起動を通常のアプリ導入で
+変更しない。Enable は backend でも acknowledgement、activation profile、固定 hash / vermagic、
+platform、UDC、既存 gadget の ownership、独立した `br-lan` 管理経路を再検証する。
+
+## `sbair-netmode` の所有権と互換性
+
+ネットワーク変更の実体は `root/usr/sbin/sbair-netmode` に一元化し、LuCI / rpcd / Go はこの
+helperへ委譲する。helperの `version` は、次の安定した機械可読マーカーを返す。
+
+```text
+implementation=luci-app-sbair-modem
+schema=1
+version=1
+```
+
+`sim` / `ap` は旧呼び出し元向けの互換エイリアスだが、現在の `apply` と同じ Safe Apply の
+transaction pathを通り、即時のネットワーク変更を行わない。`install.sh` は既存helperを、
+このマーカーまたは履歴上のアプリ所有ハッシュで判定する。未知の外部実装は上書きせず停止する。
+検証済みのpre-fork recovery実装を特定できるまで、その許可リストは空のままとし、未知の実装を
+自動移行しない。旧実装を明示的に認識できる場合だけ、`/root/sbair-backups/netmode-legacy/`
+へ一度だけ退避してから置き換える。自動復元は行わない。
+
+有効化の初期実装には boot-time autostart がなく、再起動後に UDC を自動取得しない。candidate v1
+は upstream の live-validated binary だが、source/binary の対応は B2 provenance 扱いであり、
+新規用途には非推奨である。ライセンスは本体 MIT と分離された GPL-2.0-only の第三者 module として
+扱う。profile の VID/PID、MAC、USB0 address、peer address は推測・ログ出力しない。
+
+緊急復旧は以下で行う。
+
+```sh
+sbair-modem netmode recover
+# または
+sbair-netmode recover
+```
+
+## Wi-Fi診断 (Monitor only)
+
+`admin/sbair/wifi/diagnostics` は、Wi-Fiを自動修復せず、次のlayerを別々に記録する。
+
+- UCI: `/etc/config/wireless` と `/etc/config/knos` のchecksum/mtime/size、band別設定
+- Vendor persistent: `/lib/wifi/mtwifi.lua`から実在する`.dat`を検出し、内容ではなくchecksum/mtime/sizeだけを保存。既知の安全なparserが実機で確認できない限り、band別の値を解析したとは表示しない
+- Vendor feature state: Wi-Fi enabled、MLO、Band Steering、Mesh
+- Runtime: `iw dev`を優先し、Hostapd、beacon counter、association、iwinfoを補助として収集
+
+PSK、password、WPS PIN、その他credentialは収集・ログ・Known-good保存の対象外である。
+相関ログは部品名と件数など最小限にし、生の `logread` 行は保存しない。診断ログを表示する際も
+credential / SSIDらしい行は行全体を置換する。通常ログはroot専用の`/var/run/sbair/wifi-drift/`に最大512KBのringとして保持し、Known-goodは
+`/etc/sbair/wifi-drift-baseline.json`へ安全なmetadataだけを保存する。起動直後、30/60/120/300秒と
+30秒周期でpollingする。AUTOのACSによるruntime channel/width変更はdriftにしない。
+
+「安全な knsh save 差分テスト」とrestart比較は自動実行せず、LuCIの明示確認が必要である。
+通常のpolling、既存Wi-Fi Applyの前後記録、MLO/Band Steeringの状態収集は、UCI書き戻し・`knsh save`・
+`wlan restart`を起こさない。MLO、Band Steering、SSID、チャンネルを含むWi-Fi設定自体も変更しない。
+package-ownedのnetwork/firewall reloadとWi-Fi restart境界には前後のaction markerを付け、
+純正WebUIなど外部からの変更はchecksum/pollingで検知する。
 
 ## APN
 
@@ -96,7 +248,7 @@ password / iptype。書いたあと `ifup wan`。
 
 > ⚠ **`network.wan` だけでは足りない。** ベンダの起動処理が `/etc/config/lte`
 > から流し込み直すので、`apn_apply` は両方へ書く。
-> → [AT.md「APN とデータコール」](https://github.com/soralis0912/sbair6-rs/blob/main/docs/AT.md)
+> APNとデータコールの挙動は、使用する機体・回線・ファームウェアの仕様を確認すること。
 
 > ⚠ **登録が無い SIM では `apn_apply` は `skipped` を返し、`lte.*` も触らない。**
 > つまり**前の SIM の APN が `/etc/config/lte` に残る**。
@@ -330,28 +482,42 @@ SCTS のタイムゾーン / DCS のベクタがある — **実機に 1 通も�
 ## 時間のかかる処理
 
 `simmap_set` / `esim_download` / `simlock_set` / `modem_reset` / `band_set` は
-同じ形。足回りは `job.go`、状態は `/tmp/sbair-<job>.json`。
+同じ形。足回りは `job.go`、状態はroot専用の`/var/run/sbair/jobs/<job>.json`。
 
 1. **ワーカーを `setsid` で切り離して起動し、すぐ返る**。
    rpcd は呼び出し終了時にプロセスグループを殺すので、`setsid` が無いと
    **途中で切られる**
-2. ワーカーは進捗を `/tmp/sbair-<job>.json` に書く
+2. ワーカーは進捗を `/var/run/sbair/jobs/<job>.json` に、0600で原子的に書く
 3. `*_status` は**そのファイルだけ**を読む。**AT には触らない** —
    ワーカーが flock を握っている間こそ進捗を見たいため
 
 ## 画面
 
-`admin/sbair` の下に 4 タブ。共通の小物は
+`admin/sbair` の下に 5 つの機能領域。各領域はLuCIの標準 `firstchild` 子画面で
+グループ化する。共通の小物は
 `htdocs/luci-static/resources/tools/sbair.js`(`require tools.sbair`)。
 
 | | |
 |---|---|
-| `admin/sbair/signal` | 電波状況 / バンド / IMS / モデムのリセット |
-| `admin/sbair/sim` | SIM マッピングと切替、カード種別、電話番号、SIM ロック、APN、profile 操作とインストール |
-| `admin/sbair/sms` | 受信 SMS。SIM ごとに一覧 |
-| `admin/sbair/device` | 機種 / ファームウェア / IMEI と温度 |
+| `admin/sbair/mobile` | モバイル回線の親画面（状態へ移動） |
+| `admin/sbair/mobile/status` | 回線概要 / 電波 / バンド / IMS / モデムのリセット |
+| `admin/sbair/mobile/sim` | SIM / eSIM。SIMマッピング、ロック、APN、profile操作を含む |
+| `admin/sbair/mobile/sms` | 受信SMS。SIMごとに一覧 |
+| `admin/sbair/wifi` | Wi-Fiの親画面（基本設定へ移動） |
+| `admin/sbair/wifi/basic` | Wi-Fi基本設定。通常のSSID / radio操作 |
+| `admin/sbair/wifi/advanced` | Wi-Fi詳細設定。無線出力 / Steering / Isolation / 11r / MACフィルタ / WPS / 再起動 |
+| `admin/sbair/wifi/diagnostics` | Wi-Fi診断。UCI / vendor persistent / runtime / Known-goodのMonitor only |
+| `admin/sbair/clients` | 接続機器一覧。端末ごとの広告ブロック操作を含む |
+| `admin/sbair/network` | ネットワークの親画面（接続モードへ移動） |
+| `admin/sbair/network/netmode` | 接続モード。高リスク設定とSafe Apply |
+| `admin/sbair/network/lan-services` | LAN DHCPサーバーの状態・切替。DHCPクライアントとは分離 |
+| `admin/sbair/network/diagnostics` | Bridge / NIC / link / USB Host Ethernet候補の読み取り専用診断 |
+| `admin/sbair/device` | 本体の親画面（本体情報へ移動） |
+| `admin/sbair/device/info` | 機種 / ファームウェア / IMEI と温度 |
+| `admin/sbair/device/usb` | USB機器の読み取り専用診断 |
+| `admin/sbair/device/update` | アップデート管理。OTA / FOTA自動更新の管理 |
 
-自動更新するのは電波状況だけ(15 秒)。他は明示のボタンで読み直す。
+自動更新するのはモバイル回線 > 状態だけ(15 秒)。他は明示のボタンで読み直す。
 処理中だけ `*_status` を 3 秒間隔で見に行き、終わったら止める。
 
 **メニューは `admin/sbair` に置いてある。** `admin/modem` は他のモデム系アプリと

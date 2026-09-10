@@ -5,6 +5,7 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -41,7 +42,7 @@ import (
 //	/data (user_data)      残る     残る       残る
 //
 // overlay は **rootfs パーティションの中**にあるので、その面を焼くと消える
-// (sbair6-rs の docs/STRIP_STOCK_UI.md §7-1)。この DB は
+// (実機検証結果)。この DB は
 // 「モデムの保存領域は溢れれば消える」「`AT+CMGL` が未読を既読に変える」から
 // 作ったものなので、**本当はモデムより長く持つ場所に置きたい。**
 //
@@ -115,7 +116,27 @@ func smsDBWarn(format string, a ...any) {
 // 動的リンクするとその前提が崩れる。バイナリは 6.1 MB → 10.4 MB になる。
 func openSMSDB() (*sql.DB, error) {
 	path := smsDBFile()
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	// The database may contain message bodies and phone numbers.  Both the
+	// default and UCI-selected locations use the same root-only parent and
+	// regular-file/no-symlink checks.
+	if err := ensurePrivateDir(filepath.Dir(path)); err != nil {
+		return nil, fmt.Errorf("SMSデータベースの親ディレクトリを保護できません: %w", err)
+	}
+	file, err := secureRuntimePath(path, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("SMSデータベースを安全に開けません: %w", err)
+	}
+	if info, statErr := file.Stat(); statErr != nil {
+		_ = file.Close()
+		return nil, statErr
+	} else if uid, ok := fileOwnerUID(info); ok && int(uid) != os.Getuid() {
+		_ = file.Close()
+		return nil, fmt.Errorf("SMSデータベースの所有者uid=%dが現在のuidと異なります", uid)
+	}
+	if err := file.Close(); err != nil {
+		return nil, err
+	}
+	if err := secureSQLiteSidecars(path); err != nil {
 		return nil, err
 	}
 	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
@@ -158,9 +179,36 @@ func openSMSDB() (*sql.DB, error) {
 			return nil, fmt.Errorf("%s: %w", strings.SplitN(q, "(", 2)[0], err)
 		}
 	}
+	if err := secureSQLiteSidecars(path); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	// 既に作られている DB への追加。**列が既にあればエラーになるので捨てる。**
 	_, _ = db.Exec(`ALTER TABLE message ADD COLUMN raw TEXT`)
 	return db, nil
+}
+
+// secureSQLiteSidecars covers the names SQLite uses for rollback journals,
+// WAL, and shared-memory files.  The private parent is the primary boundary;
+// tightening already-created sidecars makes upgrades safe as well.
+func secureSQLiteSidecars(path string) error {
+	for _, suffix := range []string{"-journal", "-wal", "-shm"} {
+		name := path + suffix
+		info, err := os.Lstat(name)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("SQLite sidecar %sを確認できません: %w", name, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("SQLite sidecar %sは通常ファイルではありません", name)
+		}
+		if err := secureExistingRuntimeFile(name, 0600); err != nil {
+			return fmt.Errorf("SQLite sidecar %sの権限を保護できません: %w", name, err)
+		}
+	}
+	return nil
 }
 
 // smsImport reads the modem and stores whatever is new.

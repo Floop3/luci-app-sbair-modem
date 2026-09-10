@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -19,7 +20,8 @@ import (
 // 仕組み:
 //  1. 対象MACに登録された端末のDNS(53番、TCP/UDPとも)だけをiptablesのDNATで
 //     Air6自身が立てる専用dnsmasq(ポート5300、br-lanでlisten)へ強制転送する
-//  2. その専用dnsmasqは StevenBlack/hosts の広告ドメインリストを0.0.0.0へ潰し、
+//  2. その専用dnsmasqは Steven Black の ad-hoc list
+//     (StevenBlack/hosts の data/StevenBlack/hosts)を0.0.0.0へ潰し、
 //     それ以外は上流(1.1.1.1 / 8.8.8.8)へ転送する
 //  3. 登録していないMACは今まで通りAtermへ素通り(何も変わらない)
 //
@@ -51,6 +53,20 @@ const (
 	adblockDNSPort   = "5300"
 	adblockChain     = "sbair_adblock"
 )
+
+var (
+	adblockIptablesRun = func(args ...string) error { return exec.Command("iptables", args...).Run() }
+	adblockDNSReadyFn  = adblockDNSReady
+	adblockMACsFn      = adblockMacs
+	adblockBrlanIPFn   = brlanIP
+)
+
+func adblockHostsFile() string {
+	if value := os.Getenv("SBAIR_ADBLOCK_HOSTS"); value != "" {
+		return value
+	}
+	return adblockHostsPath
+}
 
 // adblockMacs は adblock='1' が立っている mac の集合を返す。
 func adblockMacs() map[string]bool {
@@ -179,7 +195,7 @@ func brlanIP() string {
 }
 
 // writeAdblockHosts は埋め込んだドメインリストを hosts形式(dnsmasqのaddn-hosts用)
-// で書き出す。99,557件、約2MB。
+// で書き出す。固定revisionの生成物は現在2,804件。
 func writeAdblockHosts() error {
 	var b strings.Builder
 	b.Grow(len(adblockDomainsRaw) + len(adblockDomainsRaw)/8)
@@ -192,34 +208,149 @@ func writeAdblockHosts() error {
 		b.WriteString(domain)
 		b.WriteByte('\n')
 	}
-	return os.WriteFile(adblockHostsPath, []byte(b.String()), 0644)
+	path := adblockHostsFile()
+	if info, err := os.Lstat(filepath.Dir(path)); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		if err != nil {
+			return fmt.Errorf("hosts親ディレクトリを確認できません: %v", err)
+		}
+		return fmt.Errorf("hosts親ディレクトリが不正です")
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".sbair-adblock-hosts-")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.WriteString(b.String()); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	// Rename replaces a malicious final symlink rather than following it.
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("hostsファイルが通常ファイルではありません")
+	}
+	if info.Mode().Perm() != 0644 {
+		return fmt.Errorf("hostsファイルのmodeが0644ではありません")
+	}
+	return nil
+}
+
+func adblockDNSReady() bool {
+	out, err := exec.Command("ss", "-lun").Output()
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || !strings.HasPrefix(strings.ToLower(fields[0]), "udp") {
+			continue
+		}
+		for _, field := range fields[1:] {
+			if strings.HasSuffix(field, ":"+adblockDNSPort) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func removeAdblockRules() error {
+	if err := adblockIptablesRun("-t", "nat", "-L", adblockChain); err != nil {
+		// No package chain means there is nothing to remove.  Other iptables
+		// failures are intentionally treated the same here because stop/boot
+		// must never turn normal DNS into a partial DNAT state.
+		return nil
+	}
+	var firstErr error
+	for {
+		err := adblockIptablesRun("-t", "nat", "-D", "PREROUTING", "-j", adblockChain)
+		if err != nil {
+			break
+		}
+	}
+	if err := adblockIptablesRun("-t", "nat", "-F", adblockChain); err != nil {
+		firstErr = err
+	}
+	return firstErr
 }
 
 // applyAdblockRules はiptables nat の sbair_adblock チェーンを、現在登録されている
 // MAC集合に合わせて作り直す(flush + 再構築なので何度呼んでも安全)。
 func applyAdblockRules() error {
-	ip := brlanIP()
+	macs := adblockMACsFn()
+	if len(macs) == 0 {
+		return removeAdblockRules()
+	}
+	if !adblockDNSReadyFn() {
+		_ = removeAdblockRules()
+		return fmt.Errorf("専用dnsmasq(%s/udp)がLISTENしていません。DNATは適用しません", adblockDNSPort)
+	}
+	ip := adblockBrlanIPFn()
 	if ip == "" {
 		return fmt.Errorf("br-lanのIPアドレスを取得できません")
 	}
 	dest := ip + ":" + adblockDNSPort
 
-	_ = exec.Command("iptables", "-t", "nat", "-N", adblockChain).Run()
-	if err := exec.Command("iptables", "-t", "nat", "-F", adblockChain).Run(); err != nil {
-		return fmt.Errorf("iptables -F %s: %v", adblockChain, err)
+	created := false
+	if err := adblockIptablesRun("-t", "nat", "-N", adblockChain); err == nil {
+		created = true
+	} else if err := adblockIptablesRun("-t", "nat", "-L", adblockChain); err != nil {
+		return fmt.Errorf("iptables -N/-L %s: %v", adblockChain, err)
 	}
-	if err := exec.Command("iptables", "-t", "nat", "-C", "PREROUTING", "-j", adblockChain).Run(); err != nil {
-		if err := exec.Command("iptables", "-t", "nat", "-I", "PREROUTING", "1", "-j", adblockChain).Run(); err != nil {
-			return fmt.Errorf("iptables -I PREROUTING: %v", err)
+	cleanup := func() {
+		_ = adblockIptablesRun("-t", "nat", "-D", "PREROUTING", "-j", adblockChain)
+		_ = adblockIptablesRun("-t", "nat", "-F", adblockChain)
+		if created {
+			_ = adblockIptablesRun("-t", "nat", "-X", adblockChain)
 		}
 	}
+	if err := adblockIptablesRun("-t", "nat", "-F", adblockChain); err != nil {
+		cleanup()
+		return fmt.Errorf("iptables -F %s: %v", adblockChain, err)
+	}
+	jumpPresent := adblockIptablesRun("-t", "nat", "-C", "PREROUTING", "-j", adblockChain) == nil
+	jumpAdded := false
+	if !jumpPresent {
+		if err := adblockIptablesRun("-t", "nat", "-I", "PREROUTING", "1", "-j", adblockChain); err != nil {
+			cleanup()
+			return fmt.Errorf("iptables -I PREROUTING: %v", err)
+		}
+		jumpAdded = true
+	}
 
-	for mac := range adblockMacs() {
+	for mac := range macs {
 		for _, proto := range []string{"udp", "tcp"} {
-			_ = exec.Command("iptables", "-t", "nat", "-A", adblockChain,
+			if err := adblockIptablesRun("-t", "nat", "-A", adblockChain,
 				"-m", "mac", "--mac-source", mac,
 				"-p", proto, "--dport", "53",
-				"-j", "DNAT", "--to-destination", dest).Run()
+				"-j", "DNAT", "--to-destination", dest); err != nil {
+				// Never leave a working PREROUTING jump with only half of the
+				// MAC/protocol rules. An empty chain means normal DNS remains.
+				if jumpAdded || created {
+					cleanup()
+				} else {
+					_ = adblockIptablesRun("-t", "nat", "-F", adblockChain)
+				}
+				return fmt.Errorf("iptables -A %s (%s/%s): %v", adblockChain, mac, proto, err)
+			}
 		}
 	}
 	return nil
@@ -230,10 +361,19 @@ func applyAdblockRules() error {
 // (Goプロセスを常駐させずbusyboxのプロセス監視に任せるほうが単純なため)。
 func adblockBoot() map[string]any {
 	if err := writeAdblockHosts(); err != nil {
+		_ = removeAdblockRules()
 		return map[string]any{"error": fmt.Sprintf("hosts書き出し失敗: %v", err)}
 	}
 	if err := applyAdblockRules(); err != nil {
+		_ = removeAdblockRules()
 		return map[string]any{"error": fmt.Sprintf("ルール反映失敗: %v", err)}
 	}
 	return map[string]any{"result": "ok", "domains": strings.Count(adblockDomainsRaw, "\n")}
+}
+
+func adblockStop() map[string]any {
+	if err := removeAdblockRules(); err != nil {
+		return map[string]any{"error": fmt.Sprintf("広告ブロックDNATを解除できません: %v", err)}
+	}
+	return map[string]any{"result": "stopped"}
 }

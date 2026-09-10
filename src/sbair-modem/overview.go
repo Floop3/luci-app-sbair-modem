@@ -17,7 +17,7 @@ import (
 // would double all of that for no gain.
 //
 // **どの AT が実装されているかは機体ごとに違う。** どれが答えてどれが
-// `+CME ERROR: 4` を返すかは sbair6-rs の docs/AT.md にまとめてある。
+// `+CME ERROR: 4` を返すかは、対象機体のファームウェア仕様を確認すること。
 // ここでは**当てずっぽうで新しいコマンドを足さない**こと。
 //
 // Every field is best-effort: a modem that does not answer one probe must
@@ -180,7 +180,7 @@ func collectTemperature(o *Overview, ask func(string) []string) {
 //
 // So the answers are scored: attached beats carrying a location, which beats
 // merely answering. Ties keep the earlier (more specific) domain.
-// 実際の応答例は sbair6-rs の docs/AT.md「ネットワーク登録の読み方」。
+// 実際の応答例は、対象機体で取得した応答を確認すること。
 func collectRegistration(o *Overview, ask func(string) []string) {
 	type domain struct{ cmd, set, prefix, label string }
 	domains := []domain{

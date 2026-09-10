@@ -36,8 +36,12 @@ func sectionName(iccid string) string {
 // value makes an unset option read back as that message - and then writing it
 // somewhere else stores the error text as configuration. That is exactly what
 // put `iptype='uci: Entry not found'` into network.wan.
+var uciRunner = func(args ...string) ([]byte, error) {
+	return exec.Command("uci", args...).Output()
+}
+
 func uci(args ...string) (string, error) {
-	out, err := exec.Command("uci", args...).Output()
+	out, err := uciRunner(args...)
 	if err != nil {
 		return "", err
 	}
@@ -237,7 +241,7 @@ func apnStatus(ch *ATChannel) map[string]any {
 // **これをやらないと再起動のたびに APN が出荷時の値へ戻る。** ベンダの
 // 起動処理が `/etc/config/lte` から `network.wan.*` へ流し込むので、
 // **network.wan だけ直しても上書きされる**。ベンダの仕組みと戦わず、
-// 参照元の方に正しい値を置く。→ sbair6-rs の docs/AT.md「APN とデータコール」
+// 参照元の方に正しい値を置く。対象機体のベンダ実装を確認すること。
 //
 // mode は 5g / lte / backup / test。**どれが選ばれるかはベンダ側で決まる**
 // ので全部そろえる。存在しない mode は uci が黙って弾くので害は無い。
@@ -364,13 +368,18 @@ func apnApplyMode(ch *ATChannel, slow bool) map[string]any {
 	// **/etc/config/lte にも同じ値を入れる。** ここを直さないと再起動で戻る。
 	applyToLTE(e)
 
-	// ifup は netifd に proto を回し直させる。reload だけだと
-	// ql_datacall がセッションを張り直さないことがある。
-	if out, err := exec.Command("ifup", "wan").CombinedOutput(); err != nil {
+	// ifup は netifd に proto を回し直させる。APモードではこれを行わない。
+	// reload だけだと ql_datacall がセッションを張り直さないことがあるが、
+	// APモードで張り直すとCellular経路が復活してしまう。
+	if out, err := ifupWAN(); err != nil {
 		return map[string]any{"error": fmt.Sprintf("ifup wan: %v: %s",
 			err, strings.TrimSpace(string(out)))}
 	}
-	notes = append(notes, "WAN を張り直しました。接続まで 10〜30 秒かかります。")
+	if cellularWANAllowed() {
+		notes = append(notes, "WAN を張り直しました。接続まで 10〜30 秒かかります。")
+	} else {
+		notes = append(notes, "APモードのためWANは起動していません。モデムのAT/SMS機能は維持しています。")
+	}
 	return map[string]any{"result": "ok", "iccid": iccid, "apn": e.APN,
 		"note": strings.Join(notes, " ")}
 }

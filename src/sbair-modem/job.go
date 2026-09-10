@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 	"time"
 )
@@ -29,7 +30,10 @@ type job struct {
 	state jobState
 }
 
-func jobPath(name string) string { return "/tmp/sbair-" + name + ".json" }
+var jobExecutable = os.Executable
+
+func jobPath(name string) string     { return filepath.Join(runtimeDir(), "jobs", name+".json") }
+func jobLockPath(name string) string { return filepath.Join(runtimeDir(), "jobs", name+".lock") }
 
 func newJob(name string) *job {
 	return &job{name: name, state: jobState{
@@ -37,16 +41,12 @@ func newJob(name string) *job {
 	}}
 }
 
-func (j *job) write() {
+func (j *job) write() error {
 	b, err := json.Marshal(j.state)
 	if err != nil {
-		return
+		return err
 	}
-	// 部分的に書かれた JSON を読ませないよう、別名で書いてから置き換える。
-	tmp := jobPath(j.name) + ".tmp"
-	if os.WriteFile(tmp, b, 0644) == nil {
-		_ = os.Rename(tmp, jobPath(j.name))
-	}
+	return atomicWritePrivate(jobPath(j.name), b, 0600)
 }
 
 func (j *job) step(s string) {
@@ -67,6 +67,9 @@ func (j *job) done(step, msg string) int {
 }
 
 func readJob(name string) map[string]any {
+	if info, err := os.Lstat(jobPath(name)); err == nil && (info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular()) {
+		return map[string]any{"state": "idle"}
+	}
 	b, err := os.ReadFile(jobPath(name))
 	if err != nil {
 		return map[string]any{"state": "idle"}
@@ -84,23 +87,38 @@ func readJob(name string) map[string]any {
 // has to leave it (Setsid). Without that a switch would be cut off partway -
 // and partway means the radio is off and the mapping may already have changed.
 func startJob(name string, args ...string) map[string]any {
+	if err := ensurePrivateDir(filepath.Join(runtimeDir(), "jobs")); err != nil {
+		return map[string]any{"error": fmt.Sprintf("ジョブ実行領域を安全に準備できません: %v", err)}
+	}
+	// Wait for the short status/write/spawn critical section. Once the first
+	// caller releases it, the second caller reads the durable running state and
+	// returns the useful "already running" result instead of a misleading lock
+	// error.
+	lock, err := acquireRuntimeLock(jobLockPath(name), 5*time.Second)
+	if err != nil {
+		return map[string]any{"error": fmt.Sprintf("ジョブを開始できません: %v", err)}
+	}
+	defer lock.close()
+
 	if cur := readJob(name); cur["state"] == "running" {
 		return map[string]any{"error": "すでに実行中です", "state": "running"}
 	}
-	self, err := os.Executable()
+	self, err := jobExecutable()
 	if err != nil {
 		return map[string]any{"error": fmt.Sprintf("自分の場所が分かりません: %v", err)}
 	}
 
 	j := newJob(name)
-	j.write()
+	if err := j.write(); err != nil {
+		return map[string]any{"error": fmt.Sprintf("ジョブ状態を保存できません: %v", err)}
+	}
 
 	argv := append([]string{"-d", *device, name + "-worker"}, args...)
 	cmd := exec.Command(self, argv...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
 	if err := cmd.Start(); err != nil {
-		j.fail("起動", err.Error())
+		_ = j.fail("起動", err.Error())
 		return map[string]any{"error": fmt.Sprintf("ワーカーを起動できません: %v", err)}
 	}
 	go func() { _ = cmd.Wait() }()

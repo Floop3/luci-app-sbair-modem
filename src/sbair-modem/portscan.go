@@ -86,8 +86,24 @@ func parsePortSpec(spec string) []int {
 // scanPorts は ip の指定ポートを走査する。ports が空文字なら、これまで通り
 // commonPorts(よく使う約25ポート)だけを見る。
 func scanPorts(ip, ports string) map[string]any {
-	if net.ParseIP(ip) == nil {
-		return map[string]any{"error": fmt.Sprintf("bad ip %q", ip)}
+	networks, self, err := currentBridgeIPv4()
+	if err != nil {
+		return map[string]any{"error": fmt.Sprintf("br-lanのIPv4ネットワークを取得できません: %v", err)}
+	}
+	targetIP, err := validateLANPeer(ip, networks, self)
+	if err != nil {
+		return map[string]any{"error": fmt.Sprintf("scan target %q is not allowed: %v", ip, err)}
+	}
+	clientsResult := clientList()
+	clients, ok := clientsResult["clients"].([]clientEntry)
+	if !ok {
+		if message, exists := clientsResult["error"]; exists {
+			return map[string]any{"error": fmt.Sprintf("接続機器一覧を確認できないため走査を拒否しました: %v", message)}
+		}
+		return map[string]any{"error": "接続機器一覧を確認できないため走査を拒否しました"}
+	}
+	if !observedClientIP(targetIP.String(), clients) {
+		return map[string]any{"error": "現在のbr-lan接続機器一覧にないIPは走査できません"}
 	}
 
 	targets := map[int]string{}
@@ -116,7 +132,7 @@ func scanPorts(ip, ports string) map[string]any {
 		go func(port int, service string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			addr := fmt.Sprintf("%s:%d", ip, port)
+			addr := net.JoinHostPort(targetIP.String(), strconv.Itoa(port))
 			conn, err := net.DialTimeout("tcp4", addr, 400*time.Millisecond)
 			if err != nil {
 				return
@@ -131,7 +147,7 @@ func scanPorts(ip, ports string) map[string]any {
 	wg.Wait()
 
 	sort.Slice(open, func(i, j int) bool { return open[i].Port < open[j].Port })
-	return map[string]any{"ip": ip, "open": open, "scanned": len(targets)}
+	return map[string]any{"ip": targetIP.String(), "open": open, "scanned": len(targets)}
 }
 
 // grabBanner はポート種別に応じて短いバナー取得を試みる。失敗しても空文字を

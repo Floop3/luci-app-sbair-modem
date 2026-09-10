@@ -85,13 +85,19 @@ func runResetWorker() int {
 	if !registered {
 		// **ここで諦めない。** ネットワークにつながっていなくても WAN を戻しておかないと、
 		// 「リセットしたら余計に繋がらなくなった」状態で放置される。
-		_, _ = exec.Command("ifup", "wan").CombinedOutput()
-		return j.fail("登録", "電波は戻しましたが、時間内にネットワークにつながりませんでした。WAN は起動しています。")
+		_, _ = ifupWAN()
+		if cellularWANAllowed() {
+			return j.fail("登録", "電波は戻しましたが、時間内にネットワークにつながりませんでした。WAN は起動しています。")
+		}
+		return j.fail("登録", "電波は戻しましたが、時間内にネットワークへ登録できませんでした。APモードのためWANは起動していません。")
 	}
 
-	j.step("WAN を張り直す")
-	if out, err := exec.Command("ifup", "wan").CombinedOutput(); err != nil {
+	j.step("WAN状態を確認")
+	if out, err := ifupWAN(); err != nil {
 		return j.fail("ifup wan", fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out))))
+	}
+	if !cellularWANAllowed() {
+		return j.done("完了", "モデムをリセットしました。APモードのためWANは起動していません。")
 	}
 	return j.done("完了", "モデムをリセットし、WAN を張り直しました。接続まで 10〜30 秒かかります。")
 }

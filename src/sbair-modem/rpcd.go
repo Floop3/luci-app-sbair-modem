@@ -64,17 +64,45 @@ var methods = map[string]map[string]any{
 	"sms_purge":  {"iccid": ""},
 	// Wi-Fi。読み取りは uci の wireless をそのまま見せる。
 	"wifi_status": {},
-	// Wi-Fi書き込み(Phase 2)。apply="0"で呼ぶとuciへは書くが反映(knsh save+restart)を
-	// 保留する。複数箇所をまとめて編集してからwifi_applyを1回だけ呼ぶ運用を想定(wifi.go参照)。
-	"wifi_set":           {"iface": "", "ssid": "", "hidden": "", "disabled": "", "password": "", "encryption": "", "apply": ""},
-	"wifi_set_channel":   {"band": "", "channel": "", "apply": ""},
-	"wifi_set_bandwidth": {"band": "", "width": "", "apply": ""},
-	"wifi_set_protocol":  {"band": "", "protocol": "", "apply": ""},
-	"wifi_apply":         {},
-	"system_reboot":      {},
+	// Wi-Fi書き込み。LuCI画面の複数変更は一括RPCで検証・保存・反映する。
+	"wifi_set_channel":     {"band": "", "channel": "", "apply": ""},
+	"wifi_set_bandwidth":   {"band": "", "width": "", "apply": ""},
+	"wifi_set_protocol":    {"band": "", "protocol": "", "apply": ""},
+	"wifi_apply":           {},
+	"wifi_apply_batch":     {"changes": ""},
+	"wifi_txpower_max":     {},
+	"wifi_txpower_default": {},
+	// Wi-Fi drift monitor: normal operation is read-only; the save/restart
+	// diagnostics are separate explicit actions.
+	"wifi_drift_status":       {},
+	"wifi_drift_logs":         {},
+	"wifi_drift_set":          {"enabled": ""},
+	"wifi_drift_mark_good":    {},
+	"wifi_drift_save_test":    {},
+	"wifi_drift_restart_test": {},
+	"system_reboot":           {},
 	// SIMルータ / 光回線AP化の切替。
-	"netmode_status": {},
-	"netmode_set":    {"mode": ""},
+	"netmode_status":        {},
+	"netmode_netdev_status": {},
+	"netmode_get_config":    {},
+	"netmode_set_config":    {"proto": "", "ipaddr": "", "netmask": "", "gateway": "", "dns": "", "fallback_enabled": false, "fallback_ip": "", "fallback_netmask": "", "fallback_timeout": 0, "dhcp_start_ip": "", "dhcp_end_ip": "", "dhcp_leasetime": ""},
+	"netmode_set":           {"mode": ""},
+	"netmode_apply":         {"mode": "", "proto": "", "ipaddr": "", "netmask": "", "gateway": "", "dns": "", "fallback_enabled": false, "fallback_ip": "", "fallback_netmask": "", "fallback_timeout": 0, "dhcp_start_ip": "", "dhcp_end_ip": "", "dhcp_leasetime": ""},
+	"netmode_confirm":       {},
+	"netmode_rollback":      {},
+	"netmode_unmanage":      {},
+	"netmode_repair":        {},
+	// Device maintenance. These methods are deliberately separate from the
+	// connection-mode DHCP client controls.
+	"maintenance_status": {},
+	"dhcp_server_set":    {"enabled": false},
+	"fota_set":           {"enabled": false},
+	// USB host inventory is read-only. The USB gadget controls below are a
+	// separate optional, explicit, high-risk feature.
+	"usb_status":      {},
+	"usb_nic_status":  {},
+	"usb_nic_enable":  {"ack": false},
+	"usb_nic_disable": {},
 	// Wi-Fi追加機能(Phase 3)。全て knsh を経由する(wifi_advanced.go参照)。
 	"client_disconnect":   {"mac": ""},
 	"wifi_enabled_status": {},
@@ -126,43 +154,82 @@ func cmdRPCD(args []string) int {
 }
 
 type rpcdArgs struct {
-	ICCID            string `json:"iccid"`
-	Mapping          int    `json:"mapping"`
-	ActivationCode   string `json:"activation_code"`
-	ConfirmationCode string `json:"confirmation_code"`
-	On               bool   `json:"on"`
-	APN              string `json:"apn"`
-	Auth             string `json:"auth"`
-	Username         string `json:"username"`
-	Password         string `json:"password"`
-	IPType           string `json:"iptype"`
-	Label            string `json:"label"`
-	Nickname         string `json:"nickname"`
-	Limit            int    `json:"limit"`
-	Hash             string `json:"hash"`
-	Unlock           string `json:"unlock"`
-	IMS              string `json:"ims"`
-	LTE              string `json:"lte"`
-	NR               string `json:"nr"`
-	Iface            string `json:"iface"`
-	SSID             string `json:"ssid"`
-	Hidden           string `json:"hidden"`
-	Disabled         string `json:"disabled"`
-	Encryption       string `json:"encryption"`
-	Band             string `json:"band"`
-	Channel          string `json:"channel"`
-	Width            string `json:"width"`
-	Protocol         string `json:"protocol"`
-	Apply            string `json:"apply"`
-	MAC              string `json:"mac"`
-	Enabled          string `json:"enabled"`
-	Kind             string `json:"kind"`
-	Pin              string `json:"pin"`
-	Mode             string `json:"mode"`
-	Note             string `json:"note"`
-	IP               string `json:"ip"`
-	Ports            string `json:"ports"`
+	ICCID            string      `json:"iccid"`
+	Mapping          int         `json:"mapping"`
+	ActivationCode   string      `json:"activation_code"`
+	ConfirmationCode string      `json:"confirmation_code"`
+	On               bool        `json:"on"`
+	APN              string      `json:"apn"`
+	Auth             string      `json:"auth"`
+	Username         string      `json:"username"`
+	Password         string      `json:"password"`
+	IPType           string      `json:"iptype"`
+	Label            string      `json:"label"`
+	Nickname         string      `json:"nickname"`
+	Limit            int         `json:"limit"`
+	Hash             string      `json:"hash"`
+	Unlock           string      `json:"unlock"`
+	IMS              string      `json:"ims"`
+	LTE              string      `json:"lte"`
+	NR               string      `json:"nr"`
+	Iface            string      `json:"iface"`
+	SSID             string      `json:"ssid"`
+	Hidden           string      `json:"hidden"`
+	Disabled         string      `json:"disabled"`
+	Encryption       string      `json:"encryption"`
+	Band             string      `json:"band"`
+	Channel          string      `json:"channel"`
+	Width            string      `json:"width"`
+	Protocol         string      `json:"protocol"`
+	Apply            string      `json:"apply"`
+	Changes          string      `json:"changes"`
+	MAC              string      `json:"mac"`
+	Enabled          rpcdEnabled `json:"enabled"`
+	Kind             string      `json:"kind"`
+	Pin              string      `json:"pin"`
+	Mode             string      `json:"mode"`
+	Proto            string      `json:"proto"`
+	IPAddr           string      `json:"ipaddr"`
+	Netmask          string      `json:"netmask"`
+	Gateway          string      `json:"gateway"`
+	DNS              string      `json:"dns"`
+	FallbackEnabled  bool        `json:"fallback_enabled"`
+	FallbackIP       string      `json:"fallback_ip"`
+	FallbackNetmask  string      `json:"fallback_netmask"`
+	FallbackTimeout  int         `json:"fallback_timeout"`
+	DHCPStartIP      string      `json:"dhcp_start_ip"`
+	DHCPEndIP        string      `json:"dhcp_end_ip"`
+	DHCLeasetime     string      `json:"dhcp_leasetime"`
+	Ack              bool        `json:"ack"`
+	Note             string      `json:"note"`
+	IP               string      `json:"ip"`
+	Ports            string      `json:"ports"`
 }
+
+// rpcdEnabled accepts both the string values used by older LuCI controls and
+// the JSON booleans used by the maintenance RPCs. Keeping one field/tag also
+// avoids encoding/json silently ignoring a duplicate `enabled` field.
+type rpcdEnabled string
+
+func (v *rpcdEnabled) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*v = rpcdEnabled(s)
+		return nil
+	}
+	var b bool
+	if err := json.Unmarshal(data, &b); err == nil {
+		if b {
+			*v = "1"
+		} else {
+			*v = "0"
+		}
+		return nil
+	}
+	return fmt.Errorf("enabled must be a string or boolean")
+}
+
+func (v rpcdEnabled) String() string { return string(v) }
 
 // rpcdError keeps failures on stdout as JSON. rpcd treats a non-zero exit as
 // a broken backend and gives LuCI nothing to display, so a method that fails
@@ -248,9 +315,6 @@ func rpcdCall(method string) int {
 		// uci しか読まない。AT は不要。
 		emit(wifiStatus())
 		return 0
-	case "wifi_set":
-		emit(wifiSet(in.Iface, in.SSID, in.Hidden, in.Disabled, in.Password, in.Encryption, in.Apply))
-		return 0
 	case "wifi_set_channel":
 		emit(wifiSetChannel(in.Band, in.Channel, in.Apply))
 		return 0
@@ -263,14 +327,86 @@ func rpcdCall(method string) int {
 	case "wifi_apply":
 		emit(wifiApply())
 		return 0
+	case "wifi_apply_batch":
+		emit(wifiApplyBatch(in.Changes))
+		return 0
+	case "wifi_txpower_max":
+		emit(wifiTxPowerMax())
+		return 0
+	case "wifi_txpower_default":
+		emit(wifiTxPowerDefault())
+		return 0
+	case "wifi_drift_status":
+		emit(wifiDriftStatus())
+		return 0
+	case "wifi_drift_logs":
+		emit(wifiDriftLogs())
+		return 0
+	case "wifi_drift_set":
+		emit(wifiDriftSet(in.Enabled.String()))
+		return 0
+	case "wifi_drift_mark_good":
+		emit(wifiDriftMarkGood())
+		return 0
+	case "wifi_drift_save_test":
+		emit(wifiDriftSaveTest())
+		return 0
+	case "wifi_drift_restart_test":
+		emit(wifiDriftRestartTest())
+		return 0
 	case "system_reboot":
 		emit(systemReboot())
 		return 0
 	case "netmode_status":
 		emit(netmodeStatus())
 		return 0
+	case "netmode_netdev_status":
+		emit(netdevStatus())
+		return 0
+	case "usb_status":
+		emit(usbStatus())
+		return 0
+	case "usb_nic_status":
+		emit(usbNICStatus())
+		return 0
+	case "usb_nic_enable":
+		emit(usbNICEnable(in.Ack))
+		return 0
+	case "usb_nic_disable":
+		emit(usbNICDisable())
+		return 0
+	case "netmode_get_config":
+		emit(netmodeGetConfig())
+		return 0
+	case "netmode_set_config":
+		emit(netmodeSetConfig(in))
+		return 0
 	case "netmode_set":
 		emit(netmodeSet(in.Mode))
+		return 0
+	case "netmode_apply":
+		emit(netmodeApply(in))
+		return 0
+	case "netmode_confirm":
+		emit(netmodeConfirm())
+		return 0
+	case "netmode_rollback":
+		emit(netmodeRollback())
+		return 0
+	case "netmode_unmanage":
+		emit(netmodeUnmanage())
+		return 0
+	case "netmode_repair":
+		emit(netmodeRepair())
+		return 0
+	case "maintenance_status":
+		emit(maintenanceStatus())
+		return 0
+	case "dhcp_server_set":
+		emit(maintenanceSet("dhcp-server", maintenanceEnabled(in.Enabled)))
+		return 0
+	case "fota_set":
+		emit(maintenanceSet("fota", maintenanceEnabled(in.Enabled)))
 		return 0
 	case "client_disconnect":
 		emit(clientDisconnect(in.MAC))
@@ -279,34 +415,34 @@ func rpcdCall(method string) int {
 		emit(wifiEnabledStatus())
 		return 0
 	case "wifi_enabled_set":
-		emit(wifiEnabledSet(in.Enabled))
+		emit(wifiEnabledSet(in.Enabled.String()))
 		return 0
 	case "bandsteering_status":
 		emit(bandsteeringStatus())
 		return 0
 	case "bandsteering_set":
-		emit(bandsteeringSet(in.Enabled))
+		emit(bandsteeringSet(in.Enabled.String()))
 		return 0
 	case "isolation_status":
 		emit(isolationStatus())
 		return 0
 	case "isolation_set":
-		emit(isolationSet(in.Kind, in.Enabled))
+		emit(isolationSet(in.Kind, in.Enabled.String()))
 		return 0
 	case "wifi_11r_status":
 		emit(dot11rStatus())
 		return 0
 	case "wifi_11r_set":
-		emit(dot11rSet(in.Enabled))
+		emit(dot11rSet(in.Enabled.String()))
 		return 0
 	case "macfilter_status":
 		emit(macFilterStatus())
 		return 0
 	case "macfilter_mode_set":
-		emit(macFilterModeSet(in.Enabled))
+		emit(macFilterModeSet(in.Enabled.String()))
 		return 0
 	case "macfilter_add":
-		emit(macFilterAdd(in.MAC, in.Enabled))
+		emit(macFilterAdd(in.MAC, in.Enabled.String()))
 		return 0
 	case "macfilter_delete":
 		emit(macFilterDelete(in.MAC))
@@ -337,7 +473,7 @@ func rpcdCall(method string) int {
 		emit(adblockList())
 		return 0
 	case "adblock_set":
-		emit(adblockSet(in.MAC, in.Enabled))
+		emit(adblockSet(in.MAC, in.Enabled.String()))
 		return 0
 	}
 

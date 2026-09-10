@@ -1,0 +1,32 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 syado
+#
+# procd worker for the Air 6 vendor-writeback guard. It intentionally repairs
+# only L3/DHCP/route state; Wi-Fi, MLO, band steering, and SSIDs are out of
+# scope and are never rewritten here.
+
+PATH=${SBAIR_NETFIX_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+
+reconcile_ssid2_lan_block() {
+	[ "$(uci -q get sbair.bridge.mode 2>/dev/null)" = ap ] || return 0
+	[ "$(uci -q get sbair.bridge.managed 2>/dev/null)" = 1 ] || return 0
+	command -v ebtables >/dev/null 2>&1 || return 0
+	for mark in 0x102 0x202 0x302; do
+		ebtables -t nat -D postrouting_wlan2lan --mark "$mark" -j DROP >/dev/null 2>&1 || true
+	done
+}
+
+case "${1:-}" in
+	--daemon)
+		while [ "$(uci -q get sbair.bridge.mode 2>/dev/null)" = ap ] && [ "$(uci -q get sbair.bridge.managed 2>/dev/null)" = 1 ]; do
+			/usr/sbin/sbair-netmode repair >/dev/null 2>&1 || true
+			reconcile_ssid2_lan_block
+			sleep 15
+		done
+		;;
+	*)
+		printf '%s\n' 'usage: sbair-netfix --daemon' >&2
+		exit 2
+		;;
+esac

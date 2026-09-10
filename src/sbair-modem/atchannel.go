@@ -58,11 +58,24 @@ type ATChannel struct {
 	lastFinal string
 }
 
-// lockPath lives in /tmp because that is a tmpfs that always exists on
-// OpenWrt. /var/lock does not on every image, and a lock file that cannot be
-// created would leave this running unserialised - losing the one protection it
-// exists for, with no visible symptom until two callers collide.
-const lockPath = "/tmp/sbair-at.lock"
+// The lock lives below the root-owned runtime directory.  A lock failure is a
+// hard failure: talking to atcid without serialization can disconnect another
+// caller and can leave an eUICC operation half-applied.
+const lockPath = "/var/run/sbair/at.lock"
+
+func atLockPath() string {
+	if value := os.Getenv("SBAIR_AT_LOCK_PATH"); value != "" {
+		return value
+	}
+	return lockPath
+}
+
+func atLockTimeout() time.Duration {
+	if value, err := strconv.Atoi(os.Getenv("SBAIR_AT_LOCK_TIMEOUT_MS")); err == nil && value > 0 {
+		return time.Duration(value) * time.Millisecond
+	}
+	return 20 * time.Second
+}
 
 func NewATChannel(path string) *ATChannel {
 	return &ATChannel{path: path, timeout: 30 * time.Second}
@@ -87,24 +100,12 @@ func (c *ATChannel) lock() error {
 	if c.lockFD != nil {
 		return nil
 	}
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	l, err := acquireRuntimeLock(atLockPath(), atLockTimeout())
 	if err != nil {
-		// A read-only /var/lock is not a reason to refuse to talk to the
-		// modem at all; carry on unserialised rather than fail closed.
-		slog.Debug("[AT] cannot open lock file, continuing unserialised", "err", err)
-		return nil
+		return err
 	}
-	for i := 0; ; i++ {
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
-			c.lockFD = f
-			return nil
-		}
-		if i >= 100 { // 100 * 200ms = 20s
-			f.Close()
-			return fmt.Errorf("another sbair-modem is using the modem (%s)", lockPath)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
+	c.lockFD = l.file
+	return nil
 }
 
 // Connect is idempotent, and has to be: euicc-go's transmitter calls it when
@@ -121,17 +122,23 @@ func (c *ATChannel) Connect() error {
 	}
 	fi, err := os.Stat(c.path)
 	if err != nil {
+		_ = c.lockFD.Close()
+		c.lockFD = nil
 		return fmt.Errorf("stat %s: %w", c.path, err)
 	}
 	if fi.Mode()&os.ModeSocket != 0 {
 		conn, err := net.Dial("unix", c.path)
 		if err != nil {
+			_ = c.lockFD.Close()
+			c.lockFD = nil
 			return fmt.Errorf("dial %s: %w", c.path, err)
 		}
 		c.conn = conn
 	} else {
 		f, err := os.OpenFile(c.path, os.O_RDWR, 0)
 		if err != nil {
+			_ = c.lockFD.Close()
+			c.lockFD = nil
 			return fmt.Errorf("open %s: %w", c.path, err)
 		}
 		c.conn = f

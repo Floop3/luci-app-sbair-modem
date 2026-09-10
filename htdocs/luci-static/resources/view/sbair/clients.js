@@ -18,6 +18,8 @@
 'require tools.sbair as sbair';
 
 var callClientList = rpc.declare({ object: 'sbair', method: 'client_list' });
+var callAdblockList = rpc.declare({ object: 'sbair', method: 'adblock_list' });
+var callAdblockSet = rpc.declare({ object: 'sbair', method: 'adblock_set', params: [ 'mac', 'enabled' ] });
 var callNoteSet = rpc.declare({ object: 'sbair', method: 'client_note_set', params: [ 'mac', 'note' ] });
 var callScanPorts = rpc.declare({ object: 'sbair', method: 'client_scan_ports', params: [ 'ip', 'ports' ] });
 var callDisconnect = rpc.declare({ object: 'sbair', method: 'client_disconnect', params: [ 'mac' ] });
@@ -38,15 +40,69 @@ function linkCell(c) {
 	return c.ssid ? (label + ' (' + c.ssid + ')') : label;
 }
 
+function deviceCell(c) {
+	var name = c.name || '-';
+	var vendorOS = [ c.vendor, c.os ].filter(function(v) { return v; }).join(' / ');
+	return E('td', { 'class': 'td left' }, [
+		E('div', {
+			'style': 'max-width:14em;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden',
+			'title': c.name || c.mac || '-'
+		}, [
+			E('strong', {}, name),
+			vendorOS ? E('div', { 'style': 'opacity:.8;font-size:90%' }, vendorOS) : '',
+			E('div', { 'style': 'opacity:.7;font-size:90%' }, c.mac || '-')
+		])
+	]);
+}
+
 var columns = [
-	{ key: 'name', label: '名前' },
+	{ key: 'device', label: '端末' },
 	{ key: 'ip', label: 'IPアドレス', numeric: true },
-	{ key: 'mac', label: 'MACアドレス' },
-	{ key: 'vendor', label: 'メーカー' },
-	{ key: 'os', label: '推定OS' },
 	{ key: 'link', label: '接続' },
-	{ key: 'note', label: 'メモ' }
+	{ key: 'note', label: 'メモ' },
+	{ key: 'adblock', label: '広告ブロック' }
 ];
+
+function macKey(mac) {
+	return mac ? String(mac).trim().toLowerCase() : '';
+}
+
+// client_listの豊富な端末情報を正とし、adblock_listのMAC単位の状態だけを
+// クライアント側で重ねる。バックエンドの2つの既存RPCは変更しない。
+function mergeAdblockState(clients, adblockData) {
+	var states = {};
+	var available = !!(adblockData && !adblockData.error && Array.isArray(adblockData.clients));
+	if (available)
+		adblockData.clients.forEach(function(c) {
+			var mac = macKey(c.mac);
+			if (mac) states[mac] = !!c.adblock;
+		});
+
+	return (clients || []).map(function(c) {
+		var copy = {};
+		Object.keys(c).forEach(function(key) { copy[key] = c[key]; });
+		var mac = macKey(c.mac);
+		copy.adblock = available && !!mac && states[mac] === true;
+		copy.adblock_known = available && !!mac && Object.prototype.hasOwnProperty.call(states, mac);
+		return copy;
+	});
+}
+
+function loadClientData() {
+	return Promise.all([
+		callClientList().catch(function(err) { return { error: String(err) }; }),
+		callAdblockList().catch(function(err) { return { error: String(err) }; })
+	]).then(function(values) {
+		var clients = values[0] || {};
+		var adblock = values[1] || {};
+		var data = {};
+		Object.keys(clients).forEach(function(key) { data[key] = clients[key]; });
+		data.clients = mergeAdblockState(clients.clients, adblock);
+		data.adblock_available = !adblock.error && Array.isArray(adblock.clients);
+		if (adblock.error) data.adblock_error = adblock.error;
+		return data;
+	});
+}
 
 // IPは文字列比較だと "192.168.0.9" > "192.168.0.10" になってしまうので、
 // オクテットごとの数値比較にする。"-"(未解決)は常に末尾へ。
@@ -63,7 +119,8 @@ function sortClients(list, key, dir) {
 	var col = columns.filter(function(c) { return c.key === key; })[0];
 	var sorted = (list || []).slice();
 	sorted.sort(function(a, b) {
-		var av = a[key], bv = b[key];
+		var av = key === 'device' ? (a.name || a.mac) : a[key];
+		var bv = key === 'device' ? (b.name || b.mac) : b[key];
 		if (col && col.numeric) {
 			var ak = ipKey(av), bk = ipKey(bv);
 			if (ak === null && bk === null) return 0;
@@ -127,7 +184,18 @@ function showPortScanResult(ip, res, onRescan) {
 	]);
 }
 
-function clientTable(list, sortKey, sortDir, onSort, onSaveNote, onScan, onDisconnect) {
+function adblockControl(c, available, onToggle) {
+	if (!available || c.adblock_known !== true)
+		return E('span', { 'style': 'opacity:.7' }, available ? '状態不明' : '取得失敗');
+	return E('button', {
+		'class': c.adblock ? 'cbi-button cbi-button-positive' : 'cbi-button cbi-button-neutral',
+		'title': c.adblock ? 'クリックで広告ブロックを無効化' : 'クリックで広告ブロックを有効化',
+		'disabled': (!c.mac || c.mac === '-') ? '' : null,
+		'click': function() { onToggle(c.mac, !c.adblock); }
+	}, c.adblock ? '有効（無効化）' : '無効（有効化）');
+}
+
+function clientTable(list, sortKey, sortDir, onSort, onSaveNote, onScan, onDisconnect, adblockAvailable, onToggle) {
 	if (!list || !list.length)
 		return E('p', {}, '接続機器を取得できませんでした(またはまだいません)。');
 
@@ -139,7 +207,7 @@ function clientTable(list, sortKey, sortDir, onSort, onSaveNote, onScan, onDisco
 			'click': function() { onSort(c.key); }
 		}, c.label + arrow);
 	});
-	head.push(E('th', { 'class': 'th' }, ''));
+	head.push(E('th', { 'class': 'th' }, '操作'));
 	var rows = [ E('tr', { 'class': 'tr table-titles' }, head) ];
 
 	sortClients(list, sortKey, sortDir).forEach(function(c) {
@@ -169,19 +237,17 @@ function clientTable(list, sortKey, sortDir, onSort, onSaveNote, onScan, onDisco
 		};
 
 		rows.push(E('tr', { 'class': 'tr' }, [
-			clampCell(c.name || '-', '7em'),
+			deviceCell(c),
 			E('td', { 'class': 'td left', 'title': c.ip || '-' }, c.ip || '-'),
-			E('td', { 'class': 'td left', 'title': c.mac || '-' }, c.mac || '-'),
-			clampCell(c.vendor || '-', '10em'),
-			clampCell(c.os || '-', '4em'),
 			clampCell(linkCell(c), '10em'),
 			E('td', { 'class': 'td left' }, noteInput),
+			E('td', { 'class': 'td left' }, adblockControl(c, adblockAvailable, onToggle)),
 			// 🔴 tdに直接display:flexを当てると、ブラウザによってはtable-cellの
 			// 既定のvertical-align(メモ欄など他の素のtdが縦中央になる由来)が
 			// 効かなくなり、メモ欄と縦位置がずれる。tdは素のままにして、
 			// 中にflexのdivを1枚だけ入れる。
 			E('td', { 'class': 'td left' }, [
-				E('div', { 'style': 'display:flex;gap:.4em;white-space:nowrap' }, [
+				E('div', { 'class': 'sbair-button-group' }, [
 					E('button', {
 						'class': 'cbi-button cbi-button-action',
 						'title': 'ポートスキャン',
@@ -215,7 +281,16 @@ function render(data, opts) {
 	opts = opts || {};
 	var body = [];
 	body.push(sbair.section('接続機器 (' + ((data.clients || []).length) + '台)', [
-		clientTable(data.clients, opts.sortKey, opts.sortDir, opts.onSort, opts.onSaveNote, opts.onScan, opts.onDisconnect)
+		E('div', { 'class': 'sbair-table-scroll', 'style': 'overflow-x:auto' }, [
+			clientTable(data.clients, opts.sortKey, opts.sortDir, opts.onSort, opts.onSaveNote, opts.onScan, opts.onDisconnect, data.adblock_available, opts.onToggle)
+		])
+	]));
+	body.push(E('p', { 'style': 'opacity:.8' }, [
+		'広告ブロックは端末のMACアドレス単位で管理します。各端末は管理画面を使わなくても、',
+		E('a', { 'href': 'http://' + window.location.hostname + ':8090/', 'target': '_blank' },
+			'http://' + window.location.hostname + ':8090/'),
+		' を開けば、自分の端末だけをログインなしでON/OFFできます。',
+		data.adblock_error ? ' 広告ブロック状態の取得に失敗しました。' : ''
 	]));
 	body.push(sbair.errorBox(data.error ? [ data.error ] : null));
 	return body;
@@ -226,9 +301,7 @@ return view.extend({
 	sortDir: 1,
 
 	load: function() {
-		return callClientList().catch(function(err) {
-			return { error: String(err) };
-		});
+		return loadClientData();
 	},
 
 	render: function(data) {
@@ -272,6 +345,17 @@ return view.extend({
 						ui.addNotification(null, E('p', {}, String(err)), 'danger');
 					});
 				},
+				onToggle: function(mac, enabled) {
+					callAdblockSet(mac, enabled ? '1' : '0').then(function(res) {
+						if (res && res.error) {
+							ui.addNotification(null, E('p', {}, res.error), 'danger');
+							return;
+						}
+						return reload();
+					}).catch(function(err) {
+						ui.addNotification(null, E('p', {}, String(err)), 'danger');
+					});
+				},
 				onScan: onScan,
 				onDisconnect: function(mac) {
 					callDisconnect(mac).then(function(res) {
@@ -289,7 +373,7 @@ return view.extend({
 		};
 
 		var reload = function() {
-			return callClientList().then(function(res) {
+			return loadClientData().then(function(res) {
 				self.data = res;
 				redraw();
 			}).catch(function(err) {

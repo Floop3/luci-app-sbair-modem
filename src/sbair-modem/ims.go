@@ -21,7 +21,7 @@ import (
 // ⚠ **無効にしても IMS が完全に落ちるとは限らない。** 表示は ext_info の
 // ビットをそのまま出し、「オン/オフ」と断定しないこと。
 //
-// 切替の実測と ext_info の意味は sbair6-rs の docs/AT.md「IMS」。
+// 切替の実測と ext_info の意味は、対象機体で確認すること。
 
 // imsService maps the +CIREG <ext_info> bitmap (TS 27.007 §8.68).
 var imsService = []struct {

@@ -44,6 +44,18 @@ var CARD = {
 	euicc: 'eUICC'
 };
 
+function subsection(title, children) {
+	return E('div', { 'class': 'sbair-subsection' },
+		[ E('h4', {}, title) ].concat(children));
+}
+
+function details(title, children) {
+	return E('details', {}, [
+		E('summary', {}, title),
+		E('div', {}, children)
+	]);
+}
+
 function stateBadge(state) {
 	var on = (state === 'enabled');
 	return E('span', {
@@ -186,9 +198,11 @@ return view.extend({
 				'切替先に有効な profile が無ければ圏外になります。' +
 				'再起動すると物理スロット側へ戻ります。'));
 		}
-		body.push(sbair.section('SIM マッピング', mapChildren));
-		body.push(this.lockSection());
-		body.push(this.apnSection());
+		body.push(sbair.section('現在のSIM', [
+			subsection('SIMマッピング', mapChildren)
+		]));
+		body.push(this.simLockSection());
+		body.push(sbair.section('通信設定', [ this.apnSection() ]));
 
 		// --- eUICC ---------------------------------------------------------
 		if (st.error) {
@@ -197,29 +211,47 @@ return view.extend({
 		}
 
 		if (!st.available) {
-			body.push(sbair.section('eSIM (eUICC)', [
+			body.push(sbair.section('eSIM', [ subsection('eUICC', [
 				E('p', {}, st.reason || 'eUICC はありません。'),
 				(st.card === 'sim')
 					? E('p', {}, '通常の SIM が挿さっています。profile の操作は eUICC カードでのみ行えます。')
 					: ''
+			]) ]));
+			body.push(sbair.section('詳細操作', [
+				details('eSIMを追加', this.installer(running))
 			]));
 			return body;
 		}
 
-		body.push(sbair.section('eUICC', [ sbair.table([
-			sbair.row('EID', sbair.mask(st.eid)),
-			sbair.row('SGP.22', st.svn),
-			sbair.row('ISD-R AID', sbair.mask(st.isdr_aid))
-		]) ]));
-
-		body.push(sbair.section('profile', [
-			st.profiles_error
-				? E('div', { 'class': 'alert-message warning' }, st.profiles_error)
-				: this.profileTable(st.profiles, running)
+		body.push(sbair.section('eSIM', [
+			subsection('eUICC情報', [ sbair.table([
+				sbair.row('EID', sbair.mask(st.eid)),
+				sbair.row('SGP.22', st.svn),
+				sbair.row('ISD-R AID', sbair.mask(st.isdr_aid))
+			]) ]),
+			subsection('プロファイル', [
+				st.profiles_error
+					? E('div', { 'class': 'alert-message warning' }, st.profiles_error)
+					: this.profileTable(st.profiles, running)
+			])
 		]));
 
-		body.push(this.installer(running));
+		body.push(sbair.section('詳細操作', [
+			details('eSIMを追加', this.installer(running))
+		]));
 		return body;
+	},
+
+	// SIMロックは危険な操作だが、現在の状態は現在のSIMの近くで常に
+	// 確認できるようにする。解除・再ロックのボタンだけを折りたたむ。
+	simLockSection: function() {
+		var lk = this.data.lock || {};
+		var state = lk.locked === undefined ? '不明' : (lk.locked ? 'ロック中' : '解除済み');
+		return sbair.section('SIMロック', [
+			E('p', { 'style': 'font-size:115%;font-weight:600;margin-bottom:.6em' },
+				'現在の状態: ' + state),
+			details('SIMロック操作を表示（危険）', this.lockSection())
+		]);
 	},
 
 	// SIM ロック(ネットワークロック)。解除の鍵はファームウェア内の
@@ -237,7 +269,7 @@ return view.extend({
 				E('p', {}, [ E('strong', {}, '切替中: '), lj.step || '' ]),
 				E('p', {}, 'SIM を読み直すため電波を止めます。40〜60 秒かかります。')
 			]));
-			return sbair.section('SIM ロック', children);
+			return children;
 		}
 
 		if (lj.state === 'error')
@@ -271,7 +303,7 @@ return view.extend({
 		children.push(E('div', { 'class': 'cbi-value-description' },
 			'AT+ESMLCK を直接打ちます。切替後に SIM を読み直すため電波が一度止まります。'));
 
-		return sbair.section('SIM ロック', children);
+		return children;
 	},
 
 	confirmLock: function(on) {
@@ -316,7 +348,7 @@ return view.extend({
 		var children = [];
 
 		if (!a.iccid) {
-			return sbair.section('APN', [ E('p', {}, 'SIM が読めないため設定できません。') ]);
+			return subsection('APN', [ E('p', {}, 'SIM が読めないため設定できません。') ]);
 		}
 
 		var f = {};
@@ -465,7 +497,7 @@ return view.extend({
 			children.push(sbair.table(rows));
 		}
 
-		return sbair.section('APN', children);
+		return subsection('APN', children);
 	},
 
 	reloadApn: function(msg) {
@@ -486,12 +518,12 @@ return view.extend({
 		var busy = (dl.state === 'running');
 
 		if (busy) {
-			return sbair.section('eSIM を追加', [
+			return [
 				E('div', { 'class': 'alert-message' }, [
 					E('p', {}, [ E('strong', {}, 'インストール中: '), dl.step || '' ]),
 					E('p', {}, 'SM-DP+ との通信が終わるまで 20〜30 秒かかります。')
 				])
-			]);
+			];
 		}
 
 		var code = E('input', {
@@ -553,7 +585,7 @@ return view.extend({
 			'⚠ ダウンロードは 1 回限りのことが多く、失敗すると事業者に再発行を' +
 			'頼む必要があります。SM-DP+ には IMEI が渡ります。'));
 
-		return sbair.section('eSIM を追加', children);
+		return children;
 	},
 
 	profileTable: function(list, disabled) {

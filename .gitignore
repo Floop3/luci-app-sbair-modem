@@ -2,3 +2,4 @@
 /out/
 /src/sbair-modem/sbair-modem
 *.o
+.DS_Store

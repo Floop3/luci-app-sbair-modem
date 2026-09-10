@@ -32,6 +32,9 @@ var callWpsStatus = rpc.declare({ object: 'sbair', method: 'wps_status' });
 var callWpsRun = rpc.declare({ object: 'sbair', method: 'wps_run', params: [ 'band', 'mode', 'pin' ] });
 var callWpsPinRandom = rpc.declare({ object: 'sbair', method: 'wps_pin_random' });
 var callWpsReset = rpc.declare({ object: 'sbair', method: 'wps_reset', params: [ 'band' ] });
+var callWifiTxPowerMax = rpc.declare({ object: 'sbair', method: 'wifi_txpower_max' });
+var callWifiTxPowerDefault = rpc.declare({ object: 'sbair', method: 'wifi_txpower_default' });
+var callReboot = rpc.declare({ object: 'sbair', method: 'system_reboot' });
 
 function loadAll() {
 	return Promise.all([
@@ -44,6 +47,40 @@ function loadAll() {
 	]).then(function(r) {
 		return { enabled: r[0], bandsteering: r[1], isolation: r[2], dot11r: r[3], macfilter: r[4], wps: r[5] };
 	});
+}
+
+function manualRebootBox(onReboot) {
+	return E('div', { 'style': 'margin:.5em 0;opacity:.8' }, [
+		E('span', {}, 'Wi-Fi設定の適用時はWi-Fiドライバだけを再読み込みします(数秒切断されます。本体再起動は不要)。'),
+		' ',
+		E('span', {}, 'それでも反映されない場合(SSIDの追加/削除時など)は、'),
+		E('button', {
+			'class': 'cbi-button cbi-button-neutral',
+			'style': 'margin-left:.3em',
+			'click': onReboot
+		}, '本体を再起動'),
+		E('span', {}, 'してください。')
+	]);
+}
+
+function txPowerBox(onMax, onDefault) {
+	return E('div', { 'class': 'alert-message notice', 'style': 'margin:.5em 0' }, [
+		E('div', {}, '無線出力は、SBA6Dの現行ファームウェアが持つ最大スケール(100)に設定できます。これはdBm値ではなく、国/地域設定や規制テーブルは変更しません。'),
+		E('div', { 'class': 'sbair-button-group', 'style': 'margin-top:.5em' }, [
+			E('button', { 'class': 'cbi-button cbi-button-positive', 'click': onMax }, 'ファームウェア許容の最大出力に設定'),
+			E('button', { 'class': 'cbi-button cbi-button-neutral', 'click': onDefault }, 'デフォルト出力に戻す')
+		])
+	]);
+}
+
+function details(title, children, key, open) {
+	return E('details', {
+		'data-sbair-details-key': key,
+		'open': open ? '' : null
+	}, [
+		E('summary', {}, title),
+		E('div', {}, children)
+	]);
 }
 
 // switchRow はラベル + トグルスイッチ + 説明文の1行。onChangeはチェック状態(bool)を渡す。
@@ -93,8 +130,11 @@ function macFilterTable(list, onDelete) {
 
 function render(data, opts) {
 	data = data || {};
+	opts = opts || {};
 	var body = [];
+	var detailsState = opts.detailsState || {};
 
+	body.push(sbair.softBrickWarning('wifi'));
 	body.push(sbair.errorBox([data.enabled, data.bandsteering, data.isolation, data.dot11r, data.macfilter, data.wps]
 		.map(function(d) { return d && d.error; }).filter(Boolean)));
 
@@ -102,7 +142,10 @@ function render(data, opts) {
 		switchRow('Wi-Fi機能',
 			'オフにすると2.4/5/6GHzすべてのSSIDが停止します(有線LAN・SSHには影響しません)。',
 			data.enabled && data.enabled.enabled, opts.onEnabledChange,
-			'Wi-Fi全体を停止します。よろしいですか?(有線LANには影響しません)'),
+			'Wi-Fi全体を停止します。よろしいですか?(有線LANには影響しません)')
+	]));
+	body.push(sbair.section('無線出力', [ txPowerBox(opts.onMaxPower, opts.onDefaultPower) ]));
+	body.push(sbair.section('バンドステアリング', [
 		switchRow('バンドステアリング',
 			'デュアルバンド対応端末を混雑しにくい帯域(主に5GHz)へ誘導します。',
 			data.bandsteering && data.bandsteering.enabled, opts.onBandsteeringChange)
@@ -131,7 +174,7 @@ function render(data, opts) {
 	]));
 
 	var mf = data.macfilter || {};
-	body.push(sbair.section('MACフィルタ(許可リスト方式)', [
+	var macFilterSection = sbair.section('MACフィルタ(許可リスト方式)', [
 		switchRow('フィルタを有効化',
 			'🔴 有効にすると、下の一覧に登録され「有効」になっている端末以外は接続できなくなります。' +
 			'一覧が空のまま有効化すると誰も接続できなくなるので注意してください。',
@@ -142,20 +185,25 @@ function render(data, opts) {
 			opts.macInput,
 			E('button', { 'class': 'cbi-button cbi-button-positive', 'click': opts.onMacfilterAdd }, '追加')
 		])
-	]));
+	]);
+	body.push(details('MACフィルタ（許可リスト方式）', [ macFilterSection ], 'macfilter', detailsState.macfilter));
 
 	var wps = data.wps || {};
-	body.push(sbair.section('WPS', [
+	var wpsSection = sbair.section('WPS', [
 		E('p', { 'style': 'opacity:.7' }, 'プッシュボタン方式(PBC)を実行すると、一定時間だれでもWi-Fiに参加できる状態になります。'),
 		E('p', {}, '現在のPIN: ' + (wps.pin || '-')),
-		E('div', { 'style': 'display:flex;gap:.5em;flex-wrap:wrap' }, [
+		E('div', { 'class': 'sbair-button-group' }, [
 			E('button', { 'class': 'cbi-button cbi-button-action', 'click': function() { opts.onWpsRun('2.4G', 'pbc'); } }, '2.4GHzでPBC開始'),
 			E('button', { 'class': 'cbi-button cbi-button-action', 'click': function() { opts.onWpsRun('5G', 'pbc'); } }, '5GHzでPBC開始'),
 			E('button', { 'class': 'cbi-button cbi-button-neutral', 'click': opts.onWpsPinRandom }, 'PINを再生成'),
 			E('button', { 'class': 'cbi-button cbi-button-reset', 'click': function() { opts.onWpsReset('2.4G'); } }, '2.4GHz WPSリセット'),
 			E('button', { 'class': 'cbi-button cbi-button-reset', 'click': function() { opts.onWpsReset('5G'); } }, '5GHz WPSリセット')
 		])
-	]));
+	]);
+	body.push(details('WPS', [ wpsSection ], 'wps', detailsState.wps));
+	body.push(details('トラブルシューティング', [
+		sbair.section('本体再起動', [ manualRebootBox(opts.onReboot) ])
+	], 'troubleshooting', detailsState.troubleshooting));
 
 	return body;
 }
@@ -171,10 +219,20 @@ return view.extend({
 
 		var container = E('div', {});
 		var macInput = E('input', { 'class': 'cbi-input-text', 'type': 'text', 'placeholder': 'AA:BB:CC:DD:EE:FF' });
+		var detailsState = {};
+
+		function captureDetails() {
+			var nodes = container.querySelectorAll ? container.querySelectorAll('details[data-sbair-details-key]') : [];
+			Array.prototype.forEach.call(nodes, function(node) {
+				detailsState[node.getAttribute('data-sbair-details-key')] = !!node.open;
+			});
+		}
 
 		var redraw = function() {
+			captureDetails();
 			dom.content(container, render(self.data, {
 				macInput: macInput,
+				detailsState: detailsState,
 				onEnabledChange: function(v) {
 					callWifiEnabledSet(v ? '1' : '0').then(reportAndReload);
 				},
@@ -214,7 +272,10 @@ return view.extend({
 					if (!confirm((band === '2.4G' ? '2.4GHz' : '5GHz') + 'のWPS状態をリセットします。よろしいですか?'))
 						return;
 					callWpsReset(band).then(reportAndReload);
-				}
+				},
+				onMaxPower: setMaxPower,
+				onDefaultPower: setDefaultPower,
+				onReboot: doReboot
 			}));
 		};
 
@@ -230,6 +291,48 @@ return view.extend({
 				ui.addNotification(null, E('p', {}, res.error), 'danger');
 			}
 			return reload();
+		}
+
+		function doReboot() {
+			if (!confirm('本体を再起動します。よろしいですか?(Wi-Fi・LANとも一時的に切断されます)'))
+				return;
+			callReboot().then(function() {
+				ui.addNotification(null, E('p', {}, '再起動しています。1〜2分後にページを再読み込みしてください。'), 'info');
+			}).catch(function(err) {
+				ui.addNotification(null, E('p', {}, String(err)), 'warning');
+			});
+		}
+
+		function setMaxPower() {
+			if (!confirm('無線出力を現行ファームウェアの最大スケールに設定します。国/地域設定は変更しません。続行しますか?'))
+				return;
+			callWifiTxPowerMax().then(function(res) {
+				if (res && res.error) {
+					ui.addNotification(null, E('p', {}, res.error), 'danger');
+					return;
+				}
+				ui.addNotification(null, E('p', {},
+					(res && res.result === 'already_max') ? '既に最大スケールです。' : '最大スケールを保存し、Wi-Fi再起動を開始しました。'), 'info');
+				return reload();
+			}).catch(function(err) {
+				ui.addNotification(null, E('p', {}, String(err)), 'danger');
+			});
+		}
+
+		function setDefaultPower() {
+			if (!confirm('無線出力をSBA6Dファームウェアのデフォルト設定に戻します。国/地域設定や規制テーブルは変更しません。続行しますか?'))
+				return;
+			callWifiTxPowerDefault().then(function(res) {
+				if (res && res.error) {
+					ui.addNotification(null, E('p', {}, res.error), 'danger');
+					return;
+				}
+				ui.addNotification(null, E('p', {},
+					(res && res.result === 'already_default') ? '既にデフォルト出力です。' : 'デフォルト出力を保存し、Wi-Fi再起動を開始しました。'), 'info');
+				return reload();
+			}).catch(function(err) {
+				ui.addNotification(null, E('p', {}, String(err)), 'danger');
+			});
 		}
 
 		redraw();

@@ -24,9 +24,43 @@ function injectSectionStyle() {
 	sectionStyled = true;
 	var s = document.createElement('style');
 	s.textContent =
-		'.sbair-section{margin-bottom:18px}' +
-		'.sbair-section > .table:last-child,.sbair-section > pre:last-child{margin-bottom:0}';
+		'.sbair-section{margin-bottom:28px}' +
+		'.sbair-section > h3{margin-bottom:12px}' +
+		'.sbair-button-group{display:flex;gap:8px;align-items:center;flex-wrap:wrap}' +
+		'.sbair-section > .table:last-child,.sbair-section > pre:last-child,' +
+		'.sbair-section > .sbair-table-scroll:last-child > .table:last-child{margin-bottom:0}';
 	document.head.appendChild(s);
+}
+
+function softBrickWarning(kind) {
+	var message = kind === 'wifi'
+		? 'Wi-Fiやネットワーク設定の切り替えや設定変更を行うと、全てのネットワーク接続が失われ、ソフトブリック状態になるおそれがあります。'
+		: '接続モードの切り替えや設定変更を行うと、全てのネットワーク接続が失われ、ソフトブリック状態になるおそれがあります。';
+	if (kind === 'wifi')
+		return E('div', { 'class': 'alert-message warning' }, [
+			E('strong', {}, '⚠ ソフトブリックのおそれがあります'),
+			E('p', {}, message)
+		]);
+
+	return E('div', { 'class': 'alert-message warning' }, [
+		E('strong', {}, '⚠ ソフトブリックのおそれがあります'),
+		E('p', {}, message),
+		E('p', {}, 'リセットボタンを押しても復旧できない場合があり、その場合はUART接続による復旧が必要になります。'),
+		E('p', {}, 'UARTなどの復旧手段を確保できない場合は、これらの設定を変更しないでください。また、Safe Applyの自動ロールバック機能も、あらゆる設定失敗からの復旧を保証するものではありません。'),
+		E('div', { 'class': 'sbair-recovery-details', 'style': 'margin-top:1em;padding:.75em 1em;border-top:1px solid rgba(128,128,128,.45);font-size:85%;line-height:1.5' }, [
+			E('p', {}, 'なお、ソフトブリックした場合は、以下の環境で復旧できることを確認しています。'),
+			E('ul', { 'style': 'margin:.5em 0 .75em 1.5em' }, [
+				E('li', {}, 'UART：FT232RL（電圧：1.8 V）'),
+				E('li', {}, '配線：GND＝黒、RX＝緑、TX＝白'),
+				E('li', {}, 'ボーレート：115200'),
+				E('li', {}, '変換：ピンソケット（メス）→ USB-Aメス'),
+				E('li', {}, 'ケーブル：一般的なMicro-USBケーブル')
+			]),
+			E('p', {}, 'UART接続を行った状態で、シェルから以下のコマンドを実行することで、工場出荷状態に戻せることを確認しています。'),
+			E('pre', { 'style': 'white-space:pre-wrap;font-size:95%;margin:.5em 0' }, 'sync\n/sbin/firstboot -r -y'),
+			E('p', { 'style': 'margin-bottom:0' }, '※LuCIを含む設定や環境も初期化されるため、この操作は最終手段として行ってください。')
+		])
+	]);
 }
 
 return baseclass.extend({
@@ -97,12 +131,12 @@ return baseclass.extend({
 	},
 
 	// ⚠ **セクションの下の余白は表が持っている。** テーマの CSS には
-	// `.cbi-section` にも `h3` にも余白が無く、`.table { margin-bottom: 18px }`
+	// `.cbi-section` にも `h3` にも十分な余白が無く、`.table { margin-bottom: 18px }`
 	// だけが間隔を作っている。**だから表以外(説明文やボタン)で終わると
 	// 次のタイトルが直に続いてしまう。**
 	//
 	// 余白をセクション側へ移し、**表が最後のときはその余白を消して**
-	// 二重にしない。どちらで終わっても同じ 18px になる。
+	// 二重にしない。セクション間は28px、見出しから内容までは12pxに揃える。
 	section: function(title, children) {
 		injectSectionStyle();
 		return E('div', { 'class': 'cbi-section sbair-section' },
@@ -183,5 +217,9 @@ return baseclass.extend({
 			E('h3', {}, '取得できなかった項目'),
 			E('pre', { 'style': 'white-space:pre-wrap' }, errors.join('\n'))
 		]);
+	},
+
+	softBrickWarning: function(kind) {
+		return softBrickWarning(kind);
 	}
 });

@@ -32,7 +32,7 @@ const (
 // ⚠ **6 番目を「残り試行回数」と読んではいけない。** あれは保管できる件数の
 // 定数で、ロック→解除→削除を経ても変わらない。**試行予算は 3 番目。**
 // 残りは 3 番目 − 4 番目。各欄の同定の根拠は
-// sbair6-rs の docs/SIM_LOCK.md。
+// 各欄の同定は、対象機体で確認した仕様に基づく。
 func simlockState(ch *ATChannel) map[string]any {
 	out := map[string]any{}
 

@@ -83,10 +83,40 @@ func main() {
 		os.Exit(cmdAT(args[1:]))
 	case "rpcd":
 		os.Exit(cmdRPCD(args[1:]))
+	case "netmode":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: sbair-modem netmode recover|show|repair")
+			os.Exit(2)
+		}
+		if args[1] == "arp-probe" {
+			if len(args) != 4 {
+				emit(map[string]any{"error": "usage: sbair-modem netmode arp-probe <interface> <IPv4>"})
+				os.Exit(2)
+			}
+			conflict, err := arpProbe(args[2], args[3])
+			if err != nil {
+				emit(map[string]any{"error": err.Error()})
+				os.Exit(2)
+			}
+			emit(map[string]any{"conflict": conflict})
+			if conflict {
+				os.Exit(1)
+			}
+			return
+		}
+		if args[1] == "netdev-status" {
+			emit(netdevStatus())
+			return
+		}
+		emit(netmodeResult(args[1:]...))
+		return
 	case "adblock-boot":
 		// sbair-adblock initスクリプトから起動時に呼ばれる。hostsファイル書き出し+
 		// iptables反映のみ。専用dnsmasqの起動はinitスクリプト(シェル)側が行う。
 		emit(adblockBoot())
+		return
+	case "adblock-stop":
+		emit(adblockStop())
 		return
 	case "portal":
 		// 広告ブロック自己登録ページ(:8090)。procdがフォアグラウンドで監視する。
@@ -131,6 +161,11 @@ func main() {
 	// `another sbair-modem is using the modem` になる。
 	// 同じ形の取り違えを reset と simlock で 1 度ずつ踏んでいる。
 	switch args[0] {
+	case "wifi-drift-restart-worker":
+		if len(args) < 2 {
+			os.Exit(2)
+		}
+		os.Exit(wifiDriftRestartWorker(args[1]))
 	case "reset":
 		// CLI では待って構わないので、ワーカーの中身をそのまま同期で回す。
 		runResetWorker()
@@ -146,6 +181,31 @@ func main() {
 	case "wifi":
 		// uci しか読まない。AT デバイスは開かない。
 		emit(wifiStatus())
+		return
+	case "wifi-drift":
+		if len(args) < 2 {
+			fail("usage: sbair-modem wifi-drift snapshot|status|logs|mark-good|save-test|restart-test")
+		}
+		switch args[1] {
+		case "snapshot":
+			event := "cli"
+			if len(args) > 2 && args[2] != "" {
+				event = args[2]
+			}
+			emit(wifiDriftSnapshot(event))
+		case "status":
+			emit(wifiDriftStatus())
+		case "logs":
+			emit(wifiDriftLogs())
+		case "mark-good":
+			emit(wifiDriftMarkGood())
+		case "save-test":
+			emit(wifiDriftSaveTest())
+		case "restart-test":
+			emit(wifiDriftRestartTest())
+		default:
+			fail("unknown wifi-drift operation %q", args[1])
+		}
 		return
 	case "clients":
 		// ip neigh / iwinfo / dhcp.leases しか読まない。AT デバイスは開かない。
@@ -334,10 +394,12 @@ func usage() {
   sbair-modem ims [on|off]                 IMS: show, or switch
   sbair-modem band <LTE> <5G>              enable these bands (e.g. 1,41,42 3,28,77)
                                            reverts itself if the modem stays off-net
-  sbair-modem wifi                         Wi-Fi status (read-only, uci wireless as-is)
-  sbair-modem clients                      connected devices, wired+wireless (read-only)
+	  sbair-modem wifi                         Wi-Fi status (read-only, uci wireless as-is)
+	  sbair-modem wifi-drift status|logs|...   Wi-Fi drift monitor (read-only by default)
+	  sbair-modem clients                      connected devices, wired+wireless (read-only)
   sbair-modem apn [apply|probe]            APN: show / apply stored / ask the SIM
   sbair-modem boot                         apply everything this SIM needs (boot)
+  sbair-modem netmode recover              restore 192.168.3.1 + local DHCP
   sbair-modem gc                           reclaim leaked logical channels
   sbair-modem rpcd list|call <method>      rpcd backend (called by rpcd)
 

@@ -13,7 +13,7 @@ import (
 //
 // **ここで使う AT を別のものに置き換えないこと。** 一般的なバンド設定ツールが
 // 使う口はこの機体では通らず、別名のコマンドだけが答える。どれが効くか、
-// なぜこの名前なのかは sbair6-rs の docs/AT.md「バンド」。
+// なぜこの名前なのかは、対象機体の技術資料を確認すること。
 type BandInfo struct {
 	// いま掴んでいるバンド。
 	ServingRAT   string `json:"serving_rat,omitempty"`
@@ -67,7 +67,7 @@ type Carrier struct {
 // **役割 (PCC/SCC) は欄の値ではなく順番で決める** — 先頭が PCC。値にも
 // それらしい欄があるが未確認。**NR の中身も未確認なので解かない** — 数が
 // 0 でないことだけ見る。欄の並びを実測で確定した手順は
-// sbair6-rs の docs/AT.md「接続中のバンドと CA」。
+// 欄の並びは、対象機体で実測して確認すること。
 func parseDMFCA(v string) (cells []Carrier, nrActive bool) {
 	f := splitAT(v)
 	num := func(i int) (int, bool) {

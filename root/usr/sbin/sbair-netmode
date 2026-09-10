@@ -1,0 +1,1911 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 syado
+#
+# SoftBank Air 6 network-mode controller.
+#
+# The device already has the required br-lan membership (eth0.1/eth0.2 and the
+# 2.4/5/6 GHz AP interfaces). This helper only changes the L3 owner of that
+# bridge, disables local DHCP/RA services, and keeps cellular WAN out of the
+# default route in AP mode.
+
+PATH=${SBAIR_NETMODE_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+export PATH
+CONFIG=${SBAIR_NETMODE_CONFIG:-/etc/config/sbair}
+RUNTIME_DIR=${SBAIR_NETMODE_RUNTIME_DIR:-${SBAIR_NETMODE_STATE_DIR:-/var/run/sbair}}
+STATE_DIR=${SBAIR_NETMODE_STATE_DIR:-$RUNTIME_DIR/netmode}
+LOCK_DIR=${SBAIR_NETMODE_LOCK_DIR:-$RUNTIME_DIR/netmode.lock}
+REPAIR_FILE=${SBAIR_NETMODE_REPAIR_FILE:-$RUNTIME_DIR/netmode-repair}
+DHCP_START_FILE=${SBAIR_NETMODE_DHCP_START_FILE:-$RUNTIME_DIR/netmode-dhcp-start}
+CONFLICT_FILE=${SBAIR_NETMODE_CONFLICT_FILE:-$RUNTIME_DIR/netmode-fallback-conflict}
+FALLBACK_FILE=${SBAIR_NETMODE_FALLBACK_FILE:-$RUNTIME_DIR/netmode-fallback}
+BRIDGE=${SBAIR_NETMODE_BRIDGE:-br-lan}
+DNSMASQ_INIT=${SBAIR_NETMODE_DNSMASQ_INIT:-/etc/init.d/dnsmasq}
+VENDOR_ALIAS=172.16.255.254
+SELF=${SBAIR_NETMODE_SELF:-/usr/sbin/sbair-netmode}
+ROLLBACK_SECONDS=120
+# Stable ownership marker consumed by the installer and diagnostics. Keep this
+# independent of build dates so an installed helper can be identified safely.
+NETMODE_IMPLEMENTATION='luci-app-sbair-modem'
+NETMODE_SCHEMA='1'
+NETMODE_VERSION='1'
+SNAPSHOT_KEYS='mode managed management_proto ipaddr netmask gateway dns fallback_enabled fallback_ip fallback_netmask fallback_timeout dhcp_server cellular_wan dhcp_pool_start dhcp_pool_limit dhcp_pool_leasetime backup_ready sim_proto sim_ipaddr sim_netmask sim_gateway sim_dns sim_ip6assign sim_ip6hint sim_ip6class sim_delegate sim_dhcp_start sim_dhcp_limit sim_dhcp_leasetime sim_wan_disabled sim_wan_auto sim_dhcp_ignore sim_dhcp_ra sim_dhcp_dhcpv6 sim_dhcp_ndp network_lan_proto network_lan_ipaddr network_lan_netmask network_lan_gateway network_lan_dns network_lan_ip6assign network_lan_ip6hint network_lan_ip6class network_lan_delegate dhcp_lan_ignore dhcp_lan_ra dhcp_lan_dhcpv6 dhcp_lan_ndp dhcp_lan_start dhcp_lan_limit dhcp_lan_leasetime network_wan_disabled network_wan_auto'
+DRAFT_KEYS='proto ipaddr netmask gateway dns fallback_enabled fallback_ip fallback_netmask fallback_timeout dhcp_start dhcp_limit dhcp_leasetime'
+
+LOCK_HELD=0
+
+runtime_metadata_secure() {
+	local path expected_mode chmod_mode line mode owner uid
+	path=$1
+	expected_mode=$2
+	chmod_mode=$3
+	# SBA6's BusyBox build does not include stat(1). Use numeric ls output,
+	# which is available on the target and keeps the owner/mode checks explicit.
+	line=$(LC_ALL=C ls -ldn "$path" 2>/dev/null) || return 1
+	mode=$(printf '%s\n' "$line" | awk '{print $1}') || return 1
+	# BSD ls appends `@` when extended attributes are present; it is not part
+	# of the permission bits.
+	mode=${mode%@*}
+	owner=$(printf '%s\n' "$line" | awk '{print $3}') || return 1
+	uid=$(id -u 2>/dev/null || printf 0)
+	[ "$owner" = 0 ] || [ "$owner" = "$uid" ] || return 1
+	if [ "$mode" != "$expected_mode" ]; then
+		chmod "$chmod_mode" "$path" 2>/dev/null || return 1
+		line=$(LC_ALL=C ls -ldn "$path" 2>/dev/null) || return 1
+		mode=$(printf '%s\n' "$line" | awk '{print $1}') || return 1
+		mode=${mode%@*}
+	fi
+	[ "$mode" = "$expected_mode" ]
+}
+
+private_runtime_dir() {
+	local dir
+	dir=$1
+	[ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || return 1
+	[ ! -L "$dir" ] || return 1
+	# On the device uid is root. The uid fallback makes host fixtures usable while
+	# still rejecting a non-root-owned directory when this process is root.
+	runtime_metadata_secure "$dir" drwx------ 700
+}
+
+safe_runtime_write() {
+	local path value dir tmp
+	path=$1
+	value=$2
+	dir=$(dirname "$path")
+	private_runtime_dir "$dir" || return 1
+	tmp=$(mktemp "$path.tmp.XXXXXX" 2>/dev/null) || return 1
+	chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+	if ! printf '%s\n' "$value" > "$tmp"; then
+		rm -f "$tmp"
+		return 1
+	fi
+	mv "$tmp" "$path" 2>/dev/null || { rm -f "$tmp"; return 1; }
+	[ ! -L "$path" ]
+}
+
+private_runtime_file() {
+	local path
+	path=$1
+	[ ! -L "$path" ] || return 1
+	[ ! -e "$path" ] && return 0
+	[ -f "$path" ] || return 1
+	runtime_metadata_secure "$path" -rw------- 600
+}
+
+netmode_lock_release() {
+	[ "$LOCK_HELD" -eq 1 ] || return 0
+	rm -f "$LOCK_DIR/pid" 2>/dev/null || true
+	rmdir "$LOCK_DIR" 2>/dev/null || true
+	LOCK_HELD=0
+}
+
+netmode_lock_acquire() {
+	local holder
+	[ "$LOCK_HELD" -eq 1 ] && return 0
+	private_runtime_dir "$RUNTIME_DIR" || return 1
+	if mkdir "$LOCK_DIR" 2>/dev/null; then
+		[ ! -L "$LOCK_DIR" ] || { rmdir "$LOCK_DIR" 2>/dev/null || true; return 1; }
+		chmod 700 "$LOCK_DIR" 2>/dev/null || { rmdir "$LOCK_DIR" 2>/dev/null || true; return 1; }
+		printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null || { rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null || true; return 1; }
+		LOCK_HELD=1
+		trap netmode_lock_release EXIT INT TERM
+		return 0
+	fi
+	[ -d "$LOCK_DIR" ] && private_runtime_dir "$LOCK_DIR" || return 1
+	holder=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+	case "$holder" in
+		''|*[!0-9]*) return 2;;
+		*) kill -0 "$holder" 2>/dev/null && return 2;;
+	esac
+	# A crashed shell leaves only this private lock directory. Remove exactly the
+	# known pid file and directory, then retry once; never recursively remove it.
+	rm -f "$LOCK_DIR/pid" 2>/dev/null || return 1
+	rmdir "$LOCK_DIR" 2>/dev/null || return 2
+	if mkdir "$LOCK_DIR" 2>/dev/null; then
+		chmod 700 "$LOCK_DIR" 2>/dev/null || return 1
+		printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null || return 1
+		LOCK_HELD=1
+		trap netmode_lock_release EXIT INT TERM
+		return 0
+	fi
+	return 2
+}
+
+netmode_lock_wait() {
+	local tries rc
+	tries=0
+	while [ "$tries" -lt 480 ]; do
+		netmode_lock_acquire
+		rc=$?
+		[ "$rc" -eq 0 ] && return 0
+		[ "$rc" -eq 1 ] && return 1
+		sleep 0.25
+		tries=$((tries + 1))
+	done
+	return 2
+}
+
+now() {
+	date +%s 2>/dev/null || printf '0\n'
+}
+
+get() {
+	uci -q get "$1" 2>/dev/null || true
+}
+
+set_opt() {
+	uci -q set "$1=$2" >/dev/null 2>&1
+}
+
+del_opt() {
+	uci -q delete "$1" >/dev/null 2>&1 || true
+}
+
+commit() {
+	uci -q commit "$1" >/dev/null 2>&1
+}
+
+# OEM baseline is deliberately separate from Safe Apply snapshots. It is the
+# logical network.lan configuration that existed before this package first
+# claimed AP/Bridge ownership. Fallback (192.168.3.1 by default) is a temporary
+# recovery address and must never be used as an OEM baseline.
+oem_baseline_recorded() {
+	[ "$(get sbair.bridge.oem_baseline_ready)" = 1 ]
+}
+
+oem_baseline_available() {
+	oem_baseline_recorded || return 1
+	is_ipv4 "$(get sbair.bridge.oem_ipaddr)" || return 1
+	mask_to_prefix "$(get sbair.bridge.oem_netmask)" >/dev/null 2>&1 || return 1
+}
+
+capture_oem_baseline() {
+	local ipaddr netmask gateway dns ready
+	# Once recorded, never replace the baseline with a package-managed AP value.
+	oem_baseline_recorded && return 0
+	ipaddr=$(get network.lan.ipaddr)
+	netmask=$(get network.lan.netmask)
+	gateway=$(get network.lan.gateway)
+	dns=$(get network.lan.dns)
+	set_opt sbair.bridge.oem_ipaddr "$ipaddr" || return 1
+	set_opt sbair.bridge.oem_netmask "$netmask" || return 1
+	set_opt sbair.bridge.oem_gateway "$gateway" || return 1
+	set_opt sbair.bridge.oem_dns "$dns" || return 1
+	ready=0
+	if is_ipv4 "$ipaddr" && mask_to_prefix "$netmask" >/dev/null 2>&1; then
+		ready=1
+	fi
+	set_opt sbair.bridge.oem_baseline_ready "$ready" || return 1
+	commit sbair || return 1
+}
+
+static_resolution_reset() {
+	static_effective_ipaddr=
+	static_effective_netmask=
+	static_effective_gateway=
+	static_effective_dns=
+	static_effective_ipaddr_source=
+	static_effective_netmask_source=
+	static_effective_gateway_source=
+	static_effective_dns_source=
+	static_resolve_error=
+}
+
+resolve_static_config() {
+	local raw_ipaddr raw_netmask raw_gateway raw_dns oem_ready oem_ipaddr oem_netmask oem_gateway oem_dns
+	raw_ipaddr=${1-}
+	raw_netmask=${2-}
+	raw_gateway=${3-}
+	raw_dns=${4-}
+	static_resolution_reset
+	oem_ready=$(get sbair.bridge.oem_baseline_ready)
+	oem_ipaddr=
+	oem_netmask=
+	oem_gateway=
+	oem_dns=
+	if [ "$oem_ready" = 1 ]; then
+		oem_ipaddr=$(get sbair.bridge.oem_ipaddr)
+		oem_netmask=$(get sbair.bridge.oem_netmask)
+		oem_gateway=$(get sbair.bridge.oem_gateway)
+		oem_dns=$(get sbair.bridge.oem_dns)
+	fi
+	if [ -n "$raw_ipaddr" ]; then
+		static_effective_ipaddr=$raw_ipaddr
+		static_effective_ipaddr_source='明示指定'
+	else
+		static_effective_ipaddr=$oem_ipaddr
+		[ -n "$static_effective_ipaddr" ] && static_effective_ipaddr_source='純正設定を継承'
+	fi
+	if [ -n "$raw_netmask" ]; then
+		static_effective_netmask=$raw_netmask
+		static_effective_netmask_source='明示指定'
+	else
+		static_effective_netmask=$oem_netmask
+		[ -n "$static_effective_netmask" ] && static_effective_netmask_source='純正設定を継承'
+	fi
+	if [ -n "$raw_gateway" ]; then
+		static_effective_gateway=$raw_gateway
+		static_effective_gateway_source='明示指定'
+	else
+		static_effective_gateway=$oem_gateway
+		[ -n "$static_effective_gateway" ] && static_effective_gateway_source='純正設定を継承'
+	fi
+	if [ -n "$raw_dns" ]; then
+		static_effective_dns=$raw_dns
+		static_effective_dns_source='明示指定'
+	else
+		static_effective_dns=$oem_dns
+		[ -n "$static_effective_dns" ] && static_effective_dns_source='純正設定を継承'
+	fi
+	if [ -z "$static_effective_ipaddr" ] || ! is_ipv4 "$static_effective_ipaddr"; then
+		static_resolve_error='固定IPを解決できません。明示指定するか、先に純正のnetwork.lan.ipaddrを保存できる状態にしてください'
+		return 1
+	fi
+	if [ -z "$static_effective_netmask" ] || ! mask_to_prefix "$static_effective_netmask" >/dev/null 2>&1; then
+		static_resolve_error='ネットマスクを解決できません。明示指定するか、先に純正のnetwork.lan.netmaskを保存できる状態にしてください'
+		return 1
+	fi
+	[ -z "$static_effective_gateway" ] || is_ipv4 "$static_effective_gateway" || {
+		static_resolve_error='Gateway は有効なIPv4値が必要です'
+		return 1
+	}
+}
+
+ensure_config() {
+	local changed mode
+	changed=0
+	if [ ! -f "$CONFIG" ]; then
+		mkdir -p "$(dirname "$CONFIG")"
+		printf '%s\n' '# Managed by luci-app-sbair-modem.' > "$CONFIG"
+		changed=1
+	fi
+	if ! uci -q get sbair.bridge >/dev/null 2>&1; then
+		set_opt sbair.bridge bridge
+		changed=1
+	fi
+	mode=$(get sbair.bridge.mode)
+	if [ "$mode" != sim ] && [ "$mode" != ap ]; then
+		# Never infer AP mode from dhcp.lan.ignore. Installing the package must not
+		# change a live network; AP is entered only by an explicit apply request.
+		mode=sim
+		set_opt sbair.bridge.mode "$mode"
+		changed=1
+	fi
+	if [ -z "$(get sbair.bridge.managed)" ]; then
+		# A missing marker includes configurations created by the pre-snapshot
+		# release. Treat those as unmanaged until the user explicitly applies a
+		# mode with this release.
+		set_opt sbair.bridge.managed 0
+		changed=1
+	fi
+	if [ -z "$(get sbair.bridge.management_proto)" ]; then
+		set_opt sbair.bridge.management_proto dhcp
+		changed=1
+	fi
+	if [ -z "$(get sbair.bridge.oem_baseline_ready)" ]; then
+		# Existing installations are explicitly treated as having no proven OEM
+		# baseline until an unmanaged -> AP transition captures network.lan.*.
+		set_opt sbair.bridge.oem_baseline_ready 0
+		changed=1
+	fi
+	# AP management DHCP is available by default.  Selecting it is still a very
+	# high-risk network change: a failed apply can lose every network path and
+	# require UART recovery.  The UI displays the warning and Safe Apply cannot
+	# guarantee recovery from every failure.
+	# SIM mode DHCP is independent and remains available.
+	if [ -z "$(get sbair.bridge.ap_dhcp_enabled)" ]; then
+		set_opt sbair.bridge.ap_dhcp_enabled 1
+		changed=1
+	fi
+	if [ -z "$(get sbair.bridge.dhcp_server)" ]; then
+		set_opt sbair.bridge.dhcp_server 0
+		changed=1
+	fi
+	if [ -z "$(get sbair.bridge.cellular_wan)" ]; then
+		set_opt sbair.bridge.cellular_wan 0
+		changed=1
+	fi
+	if [ -z "$(get sbair.bridge.fallback_enabled)" ]; then
+		set_opt sbair.bridge.fallback_enabled 1
+		changed=1
+	fi
+	if [ -z "$(get sbair.bridge.fallback_ip)" ]; then
+		set_opt sbair.bridge.fallback_ip 192.168.3.1
+		changed=1
+	fi
+	if [ -z "$(get sbair.bridge.fallback_netmask)" ]; then
+		set_opt sbair.bridge.fallback_netmask 255.255.255.0
+		changed=1
+	fi
+	if [ -z "$(get sbair.bridge.fallback_timeout)" ]; then
+		set_opt sbair.bridge.fallback_timeout 15
+		changed=1
+	fi
+	[ "$changed" -eq 0 ] || commit sbair
+}
+
+ap_dhcp_allowed() {
+	local value
+	# The environment override keeps the switch easy to exercise in the host
+	# fixture without changing the device's persistent safety default.
+	value=${SBAIR_NETMODE_AP_DHCP_ENABLED-}
+	[ -n "$value" ] || value=$(get sbair.bridge.ap_dhcp_enabled)
+	[ "$value" = 1 ]
+}
+
+validate_ap_proto() {
+	local mode proto
+	mode=$1
+	proto=$2
+	if [ "$mode" = ap ] && [ "$proto" = dhcp ] && ! ap_dhcp_allowed; then
+		printf '%s\n' 'error=APモードのDHCPクライアントは安全フラグで無効化されています。非常に高リスクなため、sbair.bridge.ap_dhcp_enabled=1を明示的に設定してから適用してください'
+		return 1
+	fi
+}
+
+is_ipv4() {
+	local old_ifs octet
+	[ $# -eq 1 ] || return 1
+	case "$1" in *[!0-9.]*|'') return 1;; esac
+	old_ifs=$IFS
+	IFS=.
+	set -- $1
+	IFS=$old_ifs
+	[ $# -eq 4 ] || return 1
+	for octet in "$@"; do
+		[ -n "$octet" ] || return 1
+		[ "$octet" -le 255 ] 2>/dev/null || return 1
+	done
+}
+
+mask_to_prefix() {
+	local old_ifs octet bits partial
+	[ $# -eq 1 ] || return 1
+	old_ifs=$IFS
+	IFS=.
+	set -- $1
+	IFS=$old_ifs
+	[ $# -eq 4 ] || return 1
+	bits=0
+	partial=0
+	for octet in "$@"; do
+		case "$octet" in
+			255)
+				[ "$partial" -eq 0 ] || return 1
+				bits=$((bits + 8));;
+			128)
+				[ "$partial" -eq 0 ] || return 1
+			bits=$((bits + 1)); partial=1;;
+			192)
+				[ "$partial" -eq 0 ] || return 1
+			bits=$((bits + 2)); partial=1;;
+			224)
+				[ "$partial" -eq 0 ] || return 1
+			bits=$((bits + 3)); partial=1;;
+			240)
+				[ "$partial" -eq 0 ] || return 1
+			bits=$((bits + 4)); partial=1;;
+			248)
+				[ "$partial" -eq 0 ] || return 1
+			bits=$((bits + 5)); partial=1;;
+			252)
+				[ "$partial" -eq 0 ] || return 1
+			bits=$((bits + 6)); partial=1;;
+			254)
+				[ "$partial" -eq 0 ] || return 1
+			bits=$((bits + 7)); partial=1;;
+			0) partial=1;;
+			*) return 1;;
+		esac
+	done
+	[ "$bits" -ge 1 ] && [ "$bits" -le 32 ] || return 1
+	printf '%s\n' "$bits"
+}
+
+prepare_ap_static_config() {
+	local address netmask
+	# A DHCP lease is not a durable management address. Use the configured
+	# fallback as the recovery address, or the documented direct-link address.
+	address=$(get sbair.bridge.fallback_ip)
+	[ "$address" != "$VENDOR_ALIAS" ] && is_ipv4 "$address" || address=192.168.3.1
+	netmask=$(get sbair.bridge.fallback_netmask)
+	mask_to_prefix "$netmask" >/dev/null 2>&1 || netmask=255.255.255.0
+	set_opt sbair.bridge.management_proto static || return 1
+	set_opt sbair.bridge.ipaddr "$address" || return 1
+	set_opt sbair.bridge.netmask "$netmask" || return 1
+	commit sbair || return 1
+}
+
+remember_option() {
+	local key path value
+	key=$1
+	path=$2
+	if value=$(uci -q get "$path" 2>/dev/null); then
+		set_opt "sbair.bridge.sim_${key}" "$value"
+		set_opt "sbair.bridge.sim_${key}_present" 1
+	else
+		del_opt "sbair.bridge.sim_${key}"
+		set_opt "sbair.bridge.sim_${key}_present" 0
+	fi
+}
+
+save_backup() {
+	local key
+	ensure_config
+	# This profile is only the configuration of a package-managed SIM router.
+	# A vendor/AP configuration with managed=0 is not a SIM rollback target.
+	[ "$(get sbair.bridge.managed)" = 1 ] || return 0
+	[ "$(get sbair.bridge.mode)" = sim ] || return 0
+	[ "$(get sbair.bridge.backup_ready)" = 1 ] && return 0
+	for key in proto ipaddr netmask gateway dns ip6assign ip6hint ip6class delegate; do
+		remember_option "$key" "network.lan.$key"
+	done
+	for key in disabled auto; do
+		remember_option "wan_$key" "network.wan.$key"
+	done
+	for key in ignore ra dhcpv6 ndp; do
+		remember_option "dhcp_$key" "dhcp.lan.$key"
+	done
+	for key in start limit leasetime; do
+		remember_option "dhcp_$key" "dhcp.lan.$key"
+	done
+	set_opt sbair.bridge.backup_ready 1
+	commit sbair || return 1
+}
+
+clear_sim_profile() {
+	local key
+	for key in proto ipaddr netmask gateway dns ip6assign ip6hint ip6class delegate \
+		wan_disabled wan_auto dhcp_ignore dhcp_ra dhcp_dhcpv6 dhcp_ndp \
+		dhcp_start dhcp_limit dhcp_leasetime; do
+		del_opt "sbair.bridge.sim_${key}"
+		del_opt "sbair.bridge.sim_${key}_present"
+	done
+	set_opt sbair.bridge.backup_ready 0
+}
+
+snapshot_path() {
+	case "$1" in
+		mode) printf '%s\n' sbair.bridge.mode;;
+		managed) printf '%s\n' sbair.bridge.managed;;
+		management_proto) printf '%s\n' sbair.bridge.management_proto;;
+		ipaddr) printf '%s\n' sbair.bridge.ipaddr;;
+		netmask) printf '%s\n' sbair.bridge.netmask;;
+		gateway) printf '%s\n' sbair.bridge.gateway;;
+		dns) printf '%s\n' sbair.bridge.dns;;
+		fallback_enabled) printf '%s\n' sbair.bridge.fallback_enabled;;
+		fallback_ip) printf '%s\n' sbair.bridge.fallback_ip;;
+		fallback_netmask) printf '%s\n' sbair.bridge.fallback_netmask;;
+		fallback_timeout) printf '%s\n' sbair.bridge.fallback_timeout;;
+		dhcp_server) printf '%s\n' sbair.bridge.dhcp_server;;
+		cellular_wan) printf '%s\n' sbair.bridge.cellular_wan;;
+		dhcp_pool_start) printf '%s\n' sbair.bridge.dhcp_start;;
+		dhcp_pool_limit) printf '%s\n' sbair.bridge.dhcp_limit;;
+		dhcp_pool_leasetime) printf '%s\n' sbair.bridge.dhcp_leasetime;;
+		backup_ready) printf '%s\n' sbair.bridge.backup_ready;;
+		sim_proto) printf '%s\n' sbair.bridge.sim_proto;;
+		sim_ipaddr) printf '%s\n' sbair.bridge.sim_ipaddr;;
+		sim_netmask) printf '%s\n' sbair.bridge.sim_netmask;;
+		sim_gateway) printf '%s\n' sbair.bridge.sim_gateway;;
+		sim_dns) printf '%s\n' sbair.bridge.sim_dns;;
+		sim_ip6assign) printf '%s\n' sbair.bridge.sim_ip6assign;;
+		sim_ip6hint) printf '%s\n' sbair.bridge.sim_ip6hint;;
+		sim_ip6class) printf '%s\n' sbair.bridge.sim_ip6class;;
+		sim_delegate) printf '%s\n' sbair.bridge.sim_delegate;;
+		sim_dhcp_start) printf '%s\n' sbair.bridge.sim_dhcp_start;;
+		sim_dhcp_limit) printf '%s\n' sbair.bridge.sim_dhcp_limit;;
+		sim_dhcp_leasetime) printf '%s\n' sbair.bridge.sim_dhcp_leasetime;;
+		sim_wan_disabled) printf '%s\n' sbair.bridge.sim_wan_disabled;;
+		sim_wan_auto) printf '%s\n' sbair.bridge.sim_wan_auto;;
+		sim_dhcp_ignore) printf '%s\n' sbair.bridge.sim_dhcp_ignore;;
+		sim_dhcp_ra) printf '%s\n' sbair.bridge.sim_dhcp_ra;;
+		sim_dhcp_dhcpv6) printf '%s\n' sbair.bridge.sim_dhcp_dhcpv6;;
+		sim_dhcp_ndp) printf '%s\n' sbair.bridge.sim_dhcp_ndp;;
+		network_lan_proto) printf '%s\n' network.lan.proto;;
+		network_lan_ipaddr) printf '%s\n' network.lan.ipaddr;;
+		network_lan_netmask) printf '%s\n' network.lan.netmask;;
+		network_lan_gateway) printf '%s\n' network.lan.gateway;;
+		network_lan_dns) printf '%s\n' network.lan.dns;;
+		network_lan_ip6assign) printf '%s\n' network.lan.ip6assign;;
+		network_lan_ip6hint) printf '%s\n' network.lan.ip6hint;;
+		network_lan_ip6class) printf '%s\n' network.lan.ip6class;;
+		network_lan_delegate) printf '%s\n' network.lan.delegate;;
+		dhcp_lan_ignore) printf '%s\n' dhcp.lan.ignore;;
+		dhcp_lan_ra) printf '%s\n' dhcp.lan.ra;;
+		dhcp_lan_dhcpv6) printf '%s\n' dhcp.lan.dhcpv6;;
+		dhcp_lan_ndp) printf '%s\n' dhcp.lan.ndp;;
+		dhcp_lan_start) printf '%s\n' dhcp.lan.start;;
+		dhcp_lan_limit) printf '%s\n' dhcp.lan.limit;;
+		dhcp_lan_leasetime) printf '%s\n' dhcp.lan.leasetime;;
+		network_wan_disabled) printf '%s\n' network.wan.disabled;;
+		network_wan_auto) printf '%s\n' network.wan.auto;;
+		*) return 1;;
+	esac
+}
+
+snapshot_option() {
+	local prefix key path value
+	prefix=$1
+	key=$2
+	path=$3
+	if value=$(uci -q get "$path" 2>/dev/null); then
+		set_opt "sbair.bridge.${prefix}${key}" "$value" || return 1
+		set_opt "sbair.bridge.${prefix}${key}_present" 1 || return 1
+	else
+		snapshot_delete "sbair.bridge.${prefix}${key}" || return 1
+		set_opt "sbair.bridge.${prefix}${key}_present" 0 || return 1
+	fi
+}
+
+snapshot_abort() {
+	local prefix
+	prefix=$1
+	# Do not leave a partially staged snapshot that a later recovery could
+	# mistake for a complete rollback point. Best-effort cleanup is used here
+	# because the original UCI failure may also prevent cleanup writes.
+	clear_snapshot "$prefix" || true
+	set_opt "sbair.bridge.${prefix}snapshot_ready" 0 || true
+	commit sbair || true
+}
+
+snapshot_delete() {
+	local path
+	path=$1
+	# UCI returns non-zero for deleting an option which is not present on some
+	# releases. That is not a snapshot failure; an actual existing option must
+	# be deleted successfully.
+	if uci -q get "$path" >/dev/null 2>&1; then
+		uci -q delete "$path" >/dev/null 2>&1 || return 1
+	fi
+}
+
+capture_snapshot() {
+	local prefix key path
+	prefix=$1
+	# Remove any stale copy first, then persist ready=0. A previously committed
+	# ready=1 must not survive a later partial rewrite.
+	clear_snapshot "$prefix" || return 1
+	set_opt "sbair.bridge.${prefix}snapshot_ready" 0 || return 1
+	commit sbair || return 1
+	for key in $SNAPSHOT_KEYS; do
+		path=$(snapshot_path "$key") || return 1
+		snapshot_option "$prefix" "$key" "$path" || { snapshot_abort "$prefix"; return 1; }
+	done
+	set_opt "sbair.bridge.${prefix}snapshot_ready" 1 || { snapshot_abort "$prefix"; return 1; }
+	commit sbair || {
+		snapshot_abort "$prefix"
+		return 1
+	}
+	if [ "$(get "sbair.bridge.${prefix}snapshot_ready")" != 1 ]; then
+		snapshot_abort "$prefix"
+		return 1
+	fi
+}
+
+clear_snapshot() {
+	local prefix key
+	prefix=$1
+	for key in $SNAPSHOT_KEYS; do
+		snapshot_delete "sbair.bridge.${prefix}${key}" || return 1
+		snapshot_delete "sbair.bridge.${prefix}${key}_present" || return 1
+	done
+	snapshot_delete "sbair.bridge.${prefix}snapshot_ready" || return 1
+}
+
+clear_draft() {
+	local key
+	for key in $DRAFT_KEYS; do snapshot_delete "sbair.bridge.draft_${key}" || return 1; done
+	snapshot_delete sbair.bridge.draft_ready
+}
+
+sim_pool_context() {
+	local proto ipaddr netmask
+	proto=$(get sbair.bridge.sim_proto)
+	ipaddr=$(get sbair.bridge.sim_ipaddr)
+	netmask=$(get sbair.bridge.sim_netmask)
+	if [ "$(get sbair.bridge.backup_ready)" = 1 ] && [ "$proto" = static ] &&
+		is_ipv4 "$ipaddr" && mask_to_prefix "$netmask" >/dev/null; then
+		:
+	else
+		proto=$(get sbair.bridge.mode)
+		if [ "$(get sbair.bridge.managed)" = 1 ] && [ "$proto" = sim ] &&
+			[ "$(get network.lan.proto)" = static ] && is_ipv4 "$(get network.lan.ipaddr)" &&
+			mask_to_prefix "$(get network.lan.netmask)" >/dev/null; then
+			ipaddr=$(get network.lan.ipaddr)
+			netmask=$(get network.lan.netmask)
+		else
+			ipaddr=192.168.3.1
+			netmask=255.255.255.0
+		fi
+	fi
+	printf 'network=%s\nnetmask=%s\nrouter=%s\n' "$ipaddr" "$netmask" "$ipaddr"
+}
+
+pool_context() {
+	case "${1:-}" in
+		sim) sim_pool_context;;
+		*) printf '%s\n' 'error=unknown pool context'; return 1;;
+	esac
+}
+
+load_saved_config() {
+	if [ "$(get sbair.bridge.draft_ready)" = 1 ]; then
+		config_proto=$(get sbair.bridge.draft_proto)
+		config_ipaddr=$(get sbair.bridge.draft_ipaddr)
+		config_netmask=$(get sbair.bridge.draft_netmask)
+		config_gateway=$(get sbair.bridge.draft_gateway)
+		config_dns=$(get sbair.bridge.draft_dns)
+		config_enabled=$(get sbair.bridge.draft_fallback_enabled)
+		config_fallback=$(get sbair.bridge.draft_fallback_ip)
+		config_fallback_mask=$(get sbair.bridge.draft_fallback_netmask)
+		config_timeout=$(get sbair.bridge.draft_fallback_timeout)
+		config_dhcp_start=$(get sbair.bridge.draft_dhcp_start)
+		config_dhcp_limit=$(get sbair.bridge.draft_dhcp_limit)
+		config_dhcp_leasetime=$(get sbair.bridge.draft_dhcp_leasetime)
+	else
+		config_proto=$(get sbair.bridge.management_proto)
+		config_ipaddr=$(get sbair.bridge.ipaddr)
+		config_netmask=$(get sbair.bridge.netmask)
+		config_gateway=$(get sbair.bridge.gateway)
+		config_dns=$(get sbair.bridge.dns)
+		config_enabled=$(get sbair.bridge.fallback_enabled)
+		config_fallback=$(get sbair.bridge.fallback_ip)
+		config_fallback_mask=$(get sbair.bridge.fallback_netmask)
+		config_timeout=$(get sbair.bridge.fallback_timeout)
+		config_dhcp_start=$(get sbair.bridge.dhcp_start)
+		config_dhcp_limit=$(get sbair.bridge.dhcp_limit)
+		config_dhcp_leasetime=$(get sbair.bridge.dhcp_leasetime)
+	fi
+}
+
+restore_option() {
+	local key path present value
+	key=$1
+	path=$2
+	present=$(get "sbair.bridge.sim_${key}_present")
+	if [ "$present" = 1 ]; then
+		value=$(get "sbair.bridge.sim_${key}")
+		set_opt "$path" "$value"
+	else
+		del_opt "$path"
+	fi
+}
+
+restore_snapshot_option() {
+	local prefix key path present value
+	prefix=$1
+	key=$2
+	path=$(snapshot_path "$key") || return 1
+	present=$(get "sbair.bridge.${prefix}${key}_present")
+	if [ "$present" = 1 ]; then
+		value=$(get "sbair.bridge.${prefix}${key}")
+		set_opt "$path" "$value"
+	else
+		snapshot_delete "$path"
+	fi
+}
+
+restore_transaction_snapshot() {
+	local prefix previous_mode previous_managed
+	prefix=pending_prev_
+	[ "$(get sbair.bridge.${prefix}snapshot_ready)" = 1 ] || return 1
+	previous_mode=$(get "sbair.bridge.${prefix}mode")
+	previous_managed=$(get "sbair.bridge.${prefix}managed")
+	fallback_remove
+	for key in $SNAPSHOT_KEYS; do
+		restore_snapshot_option "$prefix" "$key" || return 1
+	done
+	commit network || return 1
+	commit dhcp || return 1
+	commit sbair || return 1
+	network_reload
+	if [ "$(get network.wan.disabled)" = 1 ]; then
+		ifdown wan >/dev/null 2>&1 || true
+	elif uci -q get network.wan >/dev/null 2>&1; then
+		ifup wan >/dev/null 2>&1 || true
+	fi
+	if [ "$previous_mode" = ap ] && [ "$previous_managed" = 1 ]; then
+		dhcp_guard_enable || return 1
+		[ -f "$DHCP_START_FILE" ] || safe_runtime_write "$DHCP_START_FILE" "$(date +%s)" || return 1
+	else
+		dhcp_guard_disable || true
+		rm -f "$DHCP_START_FILE" "$CONFLICT_FILE" "$FALLBACK_FILE"
+	fi
+	# Recreate the service state only for a transaction previously owned by this
+	# package. An unmanaged rollback must not restart or reinterpret vendor state.
+	if [ "$previous_managed" = 1 ]; then
+		# AP guard is installed before this check because UDP/67 is system-wide.
+		restart_dnsmasq_checked || return 1
+	fi
+	if [ "$previous_mode" = ap ] && [ "$previous_managed" = 1 ]; then
+		ensure_fallback
+	fi
+}
+
+network_reload() {
+	[ -x /usr/bin/sbair-modem ] && /usr/bin/sbair-modem wifi-drift snapshot network_reload_before >/dev/null 2>&1 || true
+	/etc/init.d/network reload >/dev/null 2>&1 || true
+	ifup lan >/dev/null 2>&1 || true
+	[ -x /usr/bin/sbair-modem ] && /usr/bin/sbair-modem wifi-drift snapshot network_reload_after >/dev/null 2>&1 || true
+}
+
+apply_ap_config() {
+	local proto
+	ensure_config
+	save_backup || return 1
+	fallback_remove
+	proto=$(get sbair.bridge.management_proto)
+	if [ "$proto" = dhcp ] && ! ap_dhcp_allowed; then
+		prepare_ap_static_config || return 1
+		proto=static
+	fi
+	[ "$proto" = dhcp ] || proto=static
+	set_opt network.lan.proto "$proto"
+	if [ "$proto" = dhcp ]; then
+		for key in ipaddr netmask gateway dns ip6assign ip6hint ip6class; do
+			del_opt "network.lan.$key"
+		done
+	else
+		# Blank raw fields inherit the captured OEM logical LAN values. Resolve and
+		# validate before changing network.lan so an incomplete configuration cannot
+		# leave the device without a management address.
+		resolve_static_config "$(get sbair.bridge.ipaddr)" "$(get sbair.bridge.netmask)" \
+			"$(get sbair.bridge.gateway)" "$(get sbair.bridge.dns)" || return 1
+		set_opt network.lan.ipaddr "$static_effective_ipaddr" || return 1
+		set_opt network.lan.netmask "$static_effective_netmask" || return 1
+		if [ -n "$static_effective_gateway" ]; then set_opt network.lan.gateway "$static_effective_gateway"; else del_opt network.lan.gateway; fi
+		if [ -n "$static_effective_dns" ]; then set_opt network.lan.dns "$static_effective_dns"; else del_opt network.lan.dns; fi
+		for key in ip6assign ip6hint ip6class; do del_opt "network.lan.$key"; done
+	fi
+	set_opt network.lan.delegate 0
+	set_opt dhcp.lan.ignore 1
+	set_opt dhcp.lan.ra disabled
+	set_opt dhcp.lan.dhcpv6 disabled
+	set_opt dhcp.lan.ndp disabled
+	if uci -q get network.wan >/dev/null 2>&1; then
+		set_opt network.wan.disabled 1
+		set_opt network.wan.auto 0
+	fi
+	set_opt sbair.bridge.mode ap
+	set_opt sbair.bridge.managed 1
+	# Install the packet guard before any reload can revive vendor DHCP.
+	dhcp_guard_enable || return 1
+	commit network || return 1
+	commit dhcp || return 1
+	commit sbair || return 1
+	ifdown wan >/dev/null 2>&1 || true
+	ifdown lan >/dev/null 2>&1 || true
+	network_reload
+	ifdown wan >/dev/null 2>&1 || true
+	dhcp_guard_enable || return 1
+	restart_dnsmasq_checked || return 1
+	safe_runtime_write "$DHCP_START_FILE" "$(date +%s)" || return 1
+	rm -f "$CONFLICT_FILE" "$FALLBACK_FILE"
+}
+
+apply_sim_config() {
+	local force ipaddr netmask profile_ready
+	force=${1:-0}
+	ensure_config
+	load_saved_config
+	dhcp_guard_disable || true
+	fallback_remove
+	ifdown wan >/dev/null 2>&1 || true
+	ifdown lan >/dev/null 2>&1 || true
+	profile_ready=0
+	[ "$force" = 0 ] && [ "$(get sbair.bridge.backup_ready)" = 1 ] && profile_ready=1
+	if [ "$force" = 1 ] || [ "$profile_ready" -ne 1 ] || [ "$(get sbair.bridge.sim_proto)" != static ]; then
+		# An unmanaged baseline is not a SIM profile. Start from the explicit,
+		# documented SIM LAN instead of combining a DHCP client with a DHCP server.
+		set_opt network.lan.proto static
+		set_opt network.lan.ipaddr 192.168.3.1
+		set_opt network.lan.netmask 255.255.255.0
+		del_opt network.lan.gateway
+		del_opt network.lan.dns
+		set_opt network.lan.delegate 0
+		for key in ip6assign ip6hint ip6class; do del_opt "network.lan.$key"; done
+	else
+		# Only a profile captured from managed SIM mode may be restored.
+		set_opt network.lan.proto static
+		restore_option ipaddr network.lan.ipaddr
+		restore_option netmask network.lan.netmask
+		ipaddr=$(get network.lan.ipaddr)
+		netmask=$(get network.lan.netmask)
+		[ -n "$ipaddr" ] || set_opt network.lan.ipaddr 192.168.3.1
+		[ -n "$netmask" ] || set_opt network.lan.netmask 255.255.255.0
+		restore_option gateway network.lan.gateway
+		restore_option dns network.lan.dns
+		restore_option ip6assign network.lan.ip6assign
+		restore_option ip6hint network.lan.ip6hint
+		restore_option ip6class network.lan.ip6class
+		restore_option delegate network.lan.delegate
+	fi
+	# Recovery and an explicit SIM transition always own a local DHCP server.
+	# Never restore an old ignore=1 value from an AP baseline.
+	set_opt dhcp.lan.ignore 0
+	if [ "$profile_ready" -eq 1 ]; then
+		restore_option dhcp_ra dhcp.lan.ra
+		restore_option dhcp_dhcpv6 dhcp.lan.dhcpv6
+		restore_option dhcp_ndp dhcp.lan.ndp
+		restore_option dhcp_start dhcp.lan.start
+		restore_option dhcp_limit dhcp.lan.limit
+		restore_option dhcp_leasetime dhcp.lan.leasetime
+		restore_option wan_disabled network.wan.disabled
+		restore_option wan_auto network.wan.auto
+	fi
+	[ -n "$config_dhcp_start" ] && set_opt dhcp.lan.start "$config_dhcp_start"
+	[ -n "$config_dhcp_limit" ] && set_opt dhcp.lan.limit "$config_dhcp_limit"
+	[ -n "$config_dhcp_leasetime" ] && set_opt dhcp.lan.leasetime "$config_dhcp_leasetime"
+	set_opt sbair.bridge.mode sim
+	set_opt sbair.bridge.managed 1
+	# The next AP transition must snapshot the current SIM settings again.
+	set_opt sbair.bridge.backup_ready 0
+	commit network || return 1
+	commit dhcp || return 1
+	commit sbair || return 1
+	network_reload
+	dhcp_guard_disable || true
+	restart_dnsmasq_checked || return 1
+	if [ "$(get network.wan.disabled)" != 1 ] && uci -q get network.wan >/dev/null 2>&1; then
+		ifup wan >/dev/null 2>&1 || true
+	fi
+	rm -f "$DHCP_START_FILE" "$CONFLICT_FILE" "$FALLBACK_FILE"
+}
+
+dhcp_address() {
+	local fallback
+	fallback=$(get sbair.bridge.fallback_ip)
+	ip -4 -o addr show dev "$BRIDGE" 2>/dev/null | awk -v f="$fallback" -v a="$VENDOR_ALIAS" -v l="$BRIDGE:fallback" '$3 == "inet" {split($4,p,"/"); temporary=0; for (i=1; i<=NF; i++) if ($i == l) temporary=1; if (!temporary && p[1] != f && p[1] != a) {print p[1]; exit}}'
+}
+
+fallback_active() {
+	local fallback
+	fallback=$(get sbair.bridge.fallback_ip)
+	ip -4 -o addr show dev "$BRIDGE" 2>/dev/null | awk -v f="$fallback" -v l="$BRIDGE:fallback" '$3 == "inet" {split($4,p,"/"); if (p[1] == f) for (i=1; i<=NF; i++) if ($i == l) found=1} END {exit found ? 0 : 1}'
+}
+
+fallback_remove() {
+	local cidr saved
+	if [ -f "$FALLBACK_FILE" ]; then
+		saved=$(cat "$FALLBACK_FILE" 2>/dev/null || true)
+		[ -z "$saved" ] || ip addr del "$saved" dev "$BRIDGE" >/dev/null 2>&1 || true
+	fi
+	for cidr in $(ip -4 -o addr show dev "$BRIDGE" 2>/dev/null | awk -v l="$BRIDGE:fallback" '$3 == "inet" {label=0; for (i=1; i<=NF; i++) if ($i == l) label=1; if (label) print $4}'); do
+		ip addr del "$cidr" dev "$BRIDGE" >/dev/null 2>&1 || true
+	done
+	rm -f "$FALLBACK_FILE"
+}
+
+fallback_add() {
+	local fallback mask prefix probe
+	fallback=$(get sbair.bridge.fallback_ip)
+	mask=$(get sbair.bridge.fallback_netmask)
+	prefix=$(mask_to_prefix "$mask") || return 1
+	# -D sends an ARP duplicate-address probe. Air 6's BusyBox omits arping, so
+	# use the static Go raw-socket probe included in this package there.
+	if command -v arping >/dev/null 2>&1; then
+		if ! arping -D -I "$BRIDGE" -c 2 -w 2 "$fallback" >/dev/null 2>&1; then
+			safe_runtime_write "$CONFLICT_FILE" conflict || return 1
+			return 1
+		fi
+	elif [ -x /usr/bin/sbair-modem ]; then
+		probe=0
+		/usr/bin/sbair-modem netmode arp-probe "$BRIDGE" "$fallback" >/dev/null 2>&1 || probe=$?
+		if [ "$probe" -eq 1 ]; then
+			safe_runtime_write "$CONFLICT_FILE" conflict || return 1
+			return 1
+		elif [ "$probe" -ne 0 ]; then
+			safe_runtime_write "$CONFLICT_FILE" probe-unavailable || return 1
+			return 1
+		fi
+	else
+		safe_runtime_write "$CONFLICT_FILE" probe-unavailable || return 1
+		return 1
+	fi
+	ip addr add "$fallback/$prefix" dev "$BRIDGE" label "$BRIDGE:fallback" >/dev/null 2>&1 || return 1
+	safe_runtime_write "$FALLBACK_FILE" "$fallback/$prefix" || return 1
+	rm -f "$CONFLICT_FILE"
+}
+
+ensure_fallback() {
+	local proto enabled fallback start timeout elapsed current
+	fallback_changed=0
+	[ "$(get sbair.bridge.mode)" = ap ] || return 0
+	proto=$(get sbair.bridge.management_proto)
+	enabled=$(get sbair.bridge.fallback_enabled)
+	if [ "$proto" != dhcp ] || [ "$enabled" != 1 ]; then
+		if fallback_active || [ -f "$FALLBACK_FILE" ]; then fallback_remove; fallback_changed=1; fi
+		return 0
+	fi
+	current=$(dhcp_address)
+	if [ -n "$current" ]; then
+		if fallback_active; then fallback_remove; fallback_changed=1; fi
+		rm -f "$DHCP_START_FILE" "$CONFLICT_FILE"
+		return 0
+	fi
+	[ -f "$DHCP_START_FILE" ] || safe_runtime_write "$DHCP_START_FILE" "$(date +%s)" || return 1
+	start=$(cat "$DHCP_START_FILE" 2>/dev/null || now)
+	timeout=$(get sbair.bridge.fallback_timeout)
+	case "$timeout" in ''|*[!0-9]*) timeout=15;; esac
+	elapsed=$(( $(now) - start ))
+	[ "$elapsed" -ge "$timeout" ] || return 0
+	if ! fallback_active; then
+		if fallback_add; then fallback_changed=1; fi
+	fi
+}
+
+udp67_listening() {
+	if command -v ss >/dev/null 2>&1; then
+		ss -lun 2>/dev/null | awk 'NR > 1 && $0 ~ /(^|[.:])67([[:space:]]|$)/ {found=1} END {exit found ? 0 : 1}' && return 0
+	fi
+	if command -v netstat >/dev/null 2>&1; then
+		netstat -lun 2>/dev/null | awk 'NR > 1 && $4 ~ /(^|[.:])67$/ {found=1} END {exit found ? 0 : 1}' && return 0
+	fi
+	awk '$2 ~ /:0043$/ {found=1} END {exit found ? 0 : 1}' /proc/net/udp /proc/net/udp6 2>/dev/null
+}
+
+dhcp_guard_present() {
+	command -v iptables >/dev/null 2>&1 || return 1
+	iptables -C OUTPUT -o "$BRIDGE" -p udp --sport 67 --dport 68 -j DROP >/dev/null 2>&1
+}
+
+dhcp_guard_enable() {
+	command -v iptables >/dev/null 2>&1 || return 1
+	if ! dhcp_guard_present; then
+		iptables -I OUTPUT 1 -o "$BRIDGE" -p udp --sport 67 --dport 68 -j DROP >/dev/null 2>&1 || return 1
+	fi
+	dhcp_guard_present
+}
+
+dhcp_guard_disable() {
+	command -v iptables >/dev/null 2>&1 || return 0
+	while dhcp_guard_present; do
+		iptables -D OUTPUT -o "$BRIDGE" -p udp --sport 67 --dport 68 -j DROP >/dev/null 2>&1 || break
+	done
+	! dhcp_guard_present
+}
+
+restart_dnsmasq_checked() {
+	local tries ignore
+	[ -x "$DNSMASQ_INIT" ] || return 1
+	"$DNSMASQ_INIT" restart >/dev/null 2>&1 || return 1
+	tries=0
+	while [ "$tries" -lt 5 ]; do
+		ignore=$(get dhcp.lan.ignore)
+		if [ "$ignore" = 1 ]; then
+			# UDP/67 is a system-wide observation on OpenWrt. A listener on
+			# another interface is not enough to call AP unsafe; the exact
+			# br-lan response path is fail-closed by the packet guard.
+			if ! udp67_listening || dhcp_guard_present; then
+				return 0
+			fi
+		else
+			udp67_listening && return 0
+		fi
+		tries=$((tries + 1))
+		sleep 1
+	done
+	return 1
+}
+
+cellular_default_route() {
+	local proto device
+	proto=$(get network.wan.proto)
+	[ "$proto" = ql_datacall ] || return 1
+	device=$(get network.wan.device)
+	ip route show 2>/dev/null | awk -v expected="$device" '$1 == "default" {for (i=1; i<NF; i++) if ($i == "dev" && ($(i+1) == expected || $(i+1) ~ /^(ccmni|rmnet|wwan|ppp)/)) found=1} END {exit found ? 0 : 1}'
+}
+
+bridge_members() {
+	local p n out
+	out=
+	for p in /sys/class/net/"$BRIDGE"/brif/*; do
+		[ -e "$p" ] || continue
+		n=${p##*/}
+		[ -n "$out" ] && out="$out "
+		out="$out$n"
+	done
+	printf '%s\n' "$out"
+}
+
+bridge_up() {
+	ip link show dev "$BRIDGE" >/dev/null 2>&1
+}
+
+default_gateway() {
+	ip route show default dev "$BRIDGE" 2>/dev/null | awk '$1 == "default" {for (i=1; i<NF; i++) if ($i == "via") {print $(i+1); exit}}'
+}
+
+dns_server() {
+	awk '/^[[:space:]]*nameserver[[:space:]]/ {print $2; exit}' /tmp/resolv.conf.d/resolv.conf.auto /etc/resolv.conf 2>/dev/null
+}
+
+wifi_band() {
+	local iface device band
+	iface=$1
+	band=$2
+	device=$(get "wireless.$iface.device")
+	[ "$(get "wireless.$iface.mode")" = ap ] || { printf '%s\n' unknown; return; }
+	[ "$(get "wireless.$iface.disabled")" != 1 ] || { printf '%s\n' 0; return; }
+	[ -n "$device" ] || { printf '%s\n' unknown; return; }
+	[ "$(get "wireless.$device.band")" = "$band" ] && printf '%s\n' 1 || printf '%s\n' 0
+}
+
+wifi_mlo() {
+	if ! uci -q get wireless.apmld1 >/dev/null 2>&1; then printf '%s\n' unknown; return; fi
+	[ "$(get wireless.apmld1.mode)" = ap ] || { printf '%s\n' 0; return; }
+	[ "$(get wireless.apmld1.disabled)" = 1 ] && printf '%s\n' 0 || printf '%s\n' 1
+}
+
+add_warning() {
+	[ -n "$warnings" ] && warnings="$warnings|"
+	warnings="$warnings$1"
+}
+
+repair_record() {
+	local count value
+	count=0
+	[ -f "$REPAIR_FILE" ] && count=$(sed -n 's/^count=//p' "$REPAIR_FILE" 2>/dev/null)
+	case "$count" in ''|*[!0-9]*) count=0;; esac
+	count=$((count + 1))
+	value=$(printf 'count=%s\nlast=%s' "$count" "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || now)")
+	safe_runtime_write "$REPAIR_FILE" "$value"
+}
+
+repair_config() {
+	local mode proto changed wan_changed lan_changed members guard dnsmasq_ok result lock_rc
+	netmode_lock_acquire
+	lock_rc=$?
+	if [ "$lock_rc" -ne 0 ]; then
+		printf '%s\n' 'result=error' 'error=network-mode transaction lock unavailable'
+		return 1
+	fi
+	ensure_config || return 1
+	mode=$(get sbair.bridge.mode)
+	if [ "$mode" != ap ] || [ "$(get sbair.bridge.managed)" != 1 ]; then
+		printf '%s\n' 'result=skipped'
+		return 0
+	fi
+	if [ "$(get sbair.bridge.management_proto)" = dhcp ] && ! ap_dhcp_allowed; then
+		prepare_ap_static_config || {
+			printf '%s\n' 'result=error' 'error=AP DHCP設定を固定IPへ移行できません'
+			return 1
+		}
+	fi
+	proto=$(get sbair.bridge.management_proto)
+	[ "$proto" = dhcp ] || proto=static
+	if [ "$proto" = static ]; then
+		resolve_static_config "$(get sbair.bridge.ipaddr)" "$(get sbair.bridge.netmask)" \
+			"$(get sbair.bridge.gateway)" "$(get sbair.bridge.dns)" || {
+			printf '%s\n' 'result=error' "error=$static_resolve_error"
+			return 1
+		}
+	fi
+	changed=0
+	wan_changed=0
+	lan_changed=0
+	guard=0
+	dnsmasq_ok=1
+	dhcp_guard_enable && guard=1
+	[ "$guard" -eq 1 ] || changed=1
+	if [ "$(get network.lan.proto)" != "$proto" ]; then set_opt network.lan.proto "$proto"; changed=1; lan_changed=1; fi
+	if [ "$proto" = dhcp ]; then
+		for key in ipaddr netmask gateway dns ip6assign ip6hint ip6class; do
+			[ -z "$(get "network.lan.$key")" ] || { del_opt "network.lan.$key"; changed=1; lan_changed=1; }
+		done
+	else
+		if [ "$(get network.lan.ipaddr)" != "$static_effective_ipaddr" ]; then set_opt network.lan.ipaddr "$static_effective_ipaddr"; changed=1; lan_changed=1; fi
+		if [ "$(get network.lan.netmask)" != "$static_effective_netmask" ]; then set_opt network.lan.netmask "$static_effective_netmask"; changed=1; lan_changed=1; fi
+		if [ -n "$static_effective_gateway" ]; then
+			if [ "$(get network.lan.gateway)" != "$static_effective_gateway" ]; then set_opt network.lan.gateway "$static_effective_gateway"; changed=1; lan_changed=1; fi
+		elif [ -n "$(get network.lan.gateway)" ]; then
+			del_opt network.lan.gateway; changed=1; lan_changed=1
+		fi
+		if [ -n "$static_effective_dns" ]; then
+			if [ "$(get network.lan.dns)" != "$static_effective_dns" ]; then set_opt network.lan.dns "$static_effective_dns"; changed=1; lan_changed=1; fi
+		elif [ -n "$(get network.lan.dns)" ]; then
+			del_opt network.lan.dns; changed=1; lan_changed=1
+		fi
+	fi
+	[ "$(get network.lan.delegate)" = 0 ] || { set_opt network.lan.delegate 0; changed=1; lan_changed=1; }
+	[ "$(get dhcp.lan.ignore)" = 1 ] || { set_opt dhcp.lan.ignore 1; changed=1; }
+	for key in ra dhcpv6 ndp; do
+		[ "$(get "dhcp.lan.$key")" = disabled ] || { set_opt "dhcp.lan.$key" disabled; changed=1; }
+	done
+	if uci -q get network.wan >/dev/null 2>&1; then
+		[ "$(get network.wan.disabled)" = 1 ] || { set_opt network.wan.disabled 1; changed=1; wan_changed=1; }
+		[ "$(get network.wan.auto)" = 0 ] || { set_opt network.wan.auto 0; changed=1; wan_changed=1; }
+	fi
+	if [ "$changed" -ne 0 ]; then
+		commit network
+		commit dhcp
+		commit sbair
+		[ "$wan_changed" -eq 0 ] || ifdown wan >/dev/null 2>&1 || true
+		if [ "$lan_changed" -ne 0 ]; then
+			network_reload
+			dhcp_guard_enable && guard=1
+		fi
+	fi
+	if udp67_listening; then
+		restart_dnsmasq_checked || dnsmasq_ok=0
+		changed=1
+	fi
+	if cellular_default_route; then
+		ifdown wan >/dev/null 2>&1 || true
+		changed=1
+	fi
+	ensure_fallback
+	[ "${fallback_changed:-0}" -eq 0 ] || changed=1
+	dhcp_guard_enable && guard=1
+	[ "$guard" -eq 1 ] || dnsmasq_ok=0
+	[ "$changed" -eq 0 ] || repair_record
+	members=$(bridge_members)
+	result=ok
+	[ "$guard" -eq 1 ] && [ "$dnsmasq_ok" -eq 1 ] || result=unsafe
+	printf 'result=%s\nchanged=%s\ndhcp_guard=%s\ndnsmasq_ok=%s\nbridge_members=%s\n' "$result" "$changed" "$guard" "$dnsmasq_ok" "$members"
+	[ "$result" = ok ]
+}
+
+clear_pending() {
+	local key
+	for key in pending_id pending_mode pending_previous pending_previous_managed pending_deadline; do snapshot_delete "sbair.bridge.$key" || return 1; done
+	clear_snapshot pending_prev_ || return 1
+	commit sbair
+}
+
+state_file_for() {
+	printf '%s/sbair-netmode-%s.state\n' "$STATE_DIR" "$1"
+}
+
+pid_file_for() {
+	printf '%s/sbair-netmode-%s.pid\n' "$STATE_DIR" "$1"
+}
+
+log_file_for() {
+	printf '%s/sbair-netmode-%s.log\n' "$STATE_DIR" "$1"
+}
+
+write_state() {
+	local id state message file tmp
+	private_runtime_dir "$STATE_DIR" || return 1
+	id=$1
+	state=$2
+	message=${3:-}
+	file=$(state_file_for "$id")
+	tmp=$(mktemp "$file.tmp.XXXXXX" 2>/dev/null) || return 1
+	chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+	{
+		printf 'state=%s\n' "$state"
+		printf 'mode=%s\n' "$(get sbair.bridge.mode)"
+		[ -z "$message" ] || printf 'message=%s\n' "$message"
+	} > "$tmp" && [ ! -L "$tmp" ] && mv "$tmp" "$file" && [ ! -L "$file" ]
+}
+
+rollback_pending() {
+	local id previous previous_managed result
+	id=$1
+	previous=$2
+	previous_managed=${3:-$(get sbair.bridge.pending_previous_managed)}
+	[ "$previous_managed" = 1 ] || previous_managed=0
+	[ "$(get sbair.bridge.pending_id)" = "$id" ] || return 1
+	write_state "$id" rolling_back
+	result=0
+	if [ "$(get sbair.bridge.pending_prev_snapshot_ready)" = 1 ]; then
+		restore_transaction_snapshot || result=1
+	elif [ "$previous_managed" = 0 ]; then
+		# A pre-snapshot pending transaction has no complete live snapshot. Do not
+		# reinterpret the old vendor configuration as AP or SIM; at least return
+		# ownership to unmanaged without changing its network settings.
+		set_opt sbair.bridge.managed 0
+		clear_draft
+		clear_sim_profile
+		commit sbair || result=1
+		dhcp_guard_disable || true
+		rm -f "$DHCP_START_FILE" "$CONFLICT_FILE" "$FALLBACK_FILE"
+		/etc/init.d/sbair-netfix stop >/dev/null 2>&1 || true
+	elif [ "$previous" = ap ]; then
+		apply_ap_config || result=1
+	else
+		apply_sim_config 0 || result=1
+	fi
+	[ "$result" -eq 0 ] || return 1
+	clear_pending || { printf '%s\n' 'error=unable to clear confirmed transaction'; return 1; }
+	if [ "$(get sbair.bridge.mode)" = ap ] && [ "$(get sbair.bridge.managed)" = 1 ]; then
+		/etc/init.d/sbair-netfix start >/dev/null 2>&1 || true
+	else
+		/etc/init.d/sbair-netfix stop >/dev/null 2>&1 || true
+	fi
+	write_state "$id" rolled_back 'rollback timer expired or requested'
+	rm -f "$(pid_file_for "$id")"
+}
+
+start_rollback_watch() {
+	local id deadline previous previous_managed log
+	id=$1
+	deadline=$2
+	previous=$3
+	previous_managed=${4:-$(get sbair.bridge.pending_previous_managed)}
+	private_runtime_dir "$STATE_DIR" || return 1
+	log=$(log_file_for "$id")
+	private_runtime_file "$log" || return 1
+	(umask 077; setsid "$SELF" --rollback-watch "$id" "$deadline" "$previous" "$previous_managed" >"$log" 2>&1 </dev/null) &
+}
+
+save_pending() {
+	local id mode previous previous_managed deadline
+	id=$1
+	mode=$2
+	previous=$3
+	previous_managed=$4
+	deadline=$5
+	set_opt sbair.bridge.pending_id "$id" || return 1
+	set_opt sbair.bridge.pending_mode "$mode" || return 1
+	set_opt sbair.bridge.pending_previous "$previous" || return 1
+	set_opt sbair.bridge.pending_previous_managed "$previous_managed" || return 1
+	set_opt sbair.bridge.pending_deadline "$deadline" || return 1
+	commit sbair
+}
+
+start_apply() {
+	local mode previous previous_managed id deadline pending pending_deadline pid config_supplied lock_rc log
+	mode=$1
+	shift
+	[ "$mode" = sim ] || [ "$mode" = ap ] || { printf 'error=unknown mode %s\n' "$mode"; return 1; }
+	netmode_lock_acquire
+	lock_rc=$?
+	if [ "$lock_rc" -ne 0 ]; then
+		[ "$lock_rc" -eq 2 ] && printf '%s\n' 'error=another network-mode transaction is running' || printf '%s\n' 'error=network-mode transaction lock unavailable'
+		return 1
+	fi
+	private_runtime_dir "$STATE_DIR" || { printf '%s\n' 'error=network-mode runtime directory unavailable'; return 1; }
+	ensure_config || return 1
+	pending=$(get sbair.bridge.pending_id)
+	if [ -n "$pending" ]; then
+		pending_deadline=$(get sbair.bridge.pending_deadline)
+		case "$pending_deadline" in ''|*[!0-9]*) pending_deadline=0;; esac
+		if [ "$(now)" -lt "$pending_deadline" ]; then
+			printf '%s\n' 'error=another mode change is awaiting confirmation'
+			return 1
+		fi
+		rollback_pending "$pending" "$(get sbair.bridge.pending_previous)" || {
+			printf '%s\n' 'error=unable to rollback previous transaction'
+			return 1
+		}
+	fi
+	config_supplied=0
+	[ "$#" -eq 0 ] || config_supplied=1
+	if [ "$config_supplied" -eq 1 ]; then
+		parse_config_args "$@"
+		validate_config_args || return 1
+	elif [ "$(get sbair.bridge.draft_ready)" = 1 ]; then
+		load_saved_config
+		validate_config_args || return 1
+		config_supplied=1
+	fi
+	validate_ap_proto "$mode" "$config_proto" || return 1
+	[ -x "$SELF" ] || { printf '%s\n' 'error=network-mode worker is not executable'; return 1; }
+	command -v setsid >/dev/null 2>&1 || { printf '%s\n' 'error=setsid is unavailable'; return 1; }
+	previous=$(get sbair.bridge.mode)
+	[ "$previous" = ap ] || previous=sim
+	previous_managed=$(get sbair.bridge.managed)
+	[ "$previous_managed" = 1 ] || previous_managed=0
+	if [ "$mode" = ap ] && [ "$previous_managed" = 0 ]; then
+		# Capture the vendor logical LAN before the worker can change it. This is
+		# independent from the transaction snapshot and is never replaced later.
+		capture_oem_baseline || { printf '%s\n' 'error=unable to save OEM network baseline'; return 1; }
+	fi
+	if [ "$mode" = ap ] && [ "$config_proto" = static ]; then
+		# Resolve only after the first unmanaged transition has had a chance to
+		# capture the vendor logical LAN. Explicit fields remain validated above.
+		resolve_static_config "$config_ipaddr" "$config_netmask" "$config_gateway" "$config_dns" || {
+			printf '%s\n' "error=$static_resolve_error"
+			return 1
+		}
+	fi
+	# Only managed SIM is allowed to create the reusable SIM profile. The live
+	# transaction snapshot is captured after that profile is durable, so rollback
+	# also restores its ownership metadata.
+	if [ "$previous_managed" = 1 ] && [ "$previous" = sim ]; then
+		save_backup || { printf '%s\n' 'error=unable to save SIM profile'; return 1; }
+	fi
+	# Always capture the live state immediately before promoting the draft.
+	# A stale draft_prev_ from an older release must never roll AP->AP back to
+	# an unrelated historical management IP or Fallback configuration.
+	capture_snapshot pending_prev_ || { printf '%s\n' 'error=unable to save configuration snapshot'; return 1; }
+	# Promote a draft only after the complete transaction snapshot is durable.
+	clear_draft || return 1
+	clear_snapshot draft_prev_ || return 1
+	if [ "$config_supplied" -ne 0 ]; then
+		write_config_args || { printf '%s\n' 'error=unable to save mode configuration'; return 1; }
+	fi
+	id="$(now)-$$"
+	deadline=$(( $(now) + ROLLBACK_SECONDS ))
+	log=$(log_file_for "$id")
+	private_runtime_file "$log" || { printf '%s\n' 'error=network-mode log file is unsafe'; return 1; }
+	private_runtime_file "$(pid_file_for "$id")" || { printf '%s\n' 'error=network-mode pid file is unsafe'; return 1; }
+	if ! save_pending "$id" "$mode" "$previous" "$previous_managed" "$deadline"; then
+		clear_pending || true
+		printf '%s\n' 'error=unable to save rollback transaction'
+		return 1
+	fi
+	(umask 077; setsid "$SELF" --apply-worker "$mode" "$id" "$previous" "$previous_managed" >"$log" 2>&1 </dev/null) &
+	pid=$!
+	if ! (umask 077; printf '%s\n' "$pid" > "$(pid_file_for "$id")"); then
+		kill "$pid" 2>/dev/null || true
+		clear_pending || true
+		printf '%s\n' 'error=unable to save worker pid'
+		return 1
+	fi
+	printf 'result=started\nmode=%s\ntransaction=%s\nrollback_seconds=%s\n' "$mode" "$id" "$ROLLBACK_SECONDS"
+}
+
+ap_management_ready() {
+	local proto
+	[ "$(get sbair.bridge.mode)" = ap ] || return 1
+	[ "$(get sbair.bridge.managed)" = 1 ] || return 1
+	proto=$(get sbair.bridge.management_proto)
+	[ "$proto" = dhcp ] || [ "$proto" = static ] || return 1
+	[ "$(get network.lan.proto)" = "$proto" ] || return 1
+	[ "$(get dhcp.lan.ignore)" = 1 ] || return 1
+	[ "$(get network.wan.disabled)" = 1 ] || return 1
+	bridge_up || return 1
+	dhcp_guard_present || return 1
+	if [ "$proto" = dhcp ]; then
+		# Do not treat the emergency Fallback or vendor alias as a successful
+		# upstream lease. A real DHCP address proves the new management path is
+		# present before the transaction is confirmed.
+		[ -n "$(dhcp_address)" ] || return 1
+		return 0
+	fi
+	resolve_static_config "$(get sbair.bridge.ipaddr)" "$(get sbair.bridge.netmask)" \
+		"$(get sbair.bridge.gateway)" "$(get sbair.bridge.dns)" || return 1
+	ip -4 -o addr show dev "$BRIDGE" 2>/dev/null |
+		awk -v expected="$static_effective_ipaddr" \
+			'$3 == "inet" {split($4,p,"/"); if (p[1] == expected) found=1} END {exit found ? 0 : 1}'
+}
+
+wait_ap_management_ready() {
+	local tries
+	tries=0
+	# Give netifd time to complete DHCP while leaving the existing 120-second
+	# rollback window intact when the lease never arrives.
+	while [ "$tries" -lt 15 ]; do
+		ap_management_ready && return 0
+		sleep 1
+		tries=$((tries + 1))
+	done
+	return 1
+}
+
+auto_confirm_applied() {
+	local id
+	id=$1
+	[ "$(get sbair.bridge.pending_id)" = "$id" ] || return 1
+	clear_pending || return 1
+	write_state "$id" confirmed 'configuration verified automatically' || return 1
+	rm -f "$(pid_file_for "$id")"
+}
+
+apply_worker() {
+	local mode id previous previous_managed lock_rc
+	mode=$1
+	id=$2
+	previous=$3
+	previous_managed=${4:-0}
+	netmode_lock_wait
+	lock_rc=$?
+	if [ "$lock_rc" -ne 0 ]; then
+		write_state "$id" error 'network-mode transaction lock unavailable'
+		return 1
+	fi
+	write_state "$id" applying
+	if [ "$mode" = ap ]; then
+		apply_ap_config
+	else
+		# First ownership claim from an unmanaged device must use the defined SIM
+		# LAN. A managed AP may restore only a profile captured from managed SIM.
+		apply_sim_config "$([ "$previous_managed" = 1 ] && printf 0 || printf 1)"
+	fi
+	if [ "$?" -ne 0 ]; then
+		rollback_pending "$id" "$previous" || true
+		write_state "$id" error 'configuration apply failed; previous mode restored'
+		return 1
+	fi
+	if [ "$mode" = ap ]; then
+		repair_config >/dev/null 2>&1 || true
+		/etc/init.d/sbair-netfix start >/dev/null 2>&1 || true
+		# DHCP can move the management address before the browser can follow it.
+		# Confirm automatically only after the target itself proves that the AP
+		# management path is healthy; otherwise retain the manual rollback window.
+		if wait_ap_management_ready && auto_confirm_applied "$id"; then
+			return 0
+		fi
+	else
+		/etc/init.d/sbair-netfix stop >/dev/null 2>&1 || true
+	fi
+	write_state "$id" applied 'confirm within the rollback window'
+	start_rollback_watch "$id" "$(get sbair.bridge.pending_deadline)" "$previous" "$previous_managed"
+}
+
+rollback_watch() {
+	local id deadline previous previous_managed remaining
+	id=$1
+	deadline=$2
+	previous=$3
+	previous_managed=${4:-$(get sbair.bridge.pending_previous_managed)}
+	while [ "$(get sbair.bridge.pending_id)" = "$id" ]; do
+		remaining=$((deadline - $(now)))
+		[ "$remaining" -gt 0 ] || break
+		sleep $(( remaining < 5 ? remaining : 5 ))
+	done
+	if [ "$(get sbair.bridge.pending_id)" = "$id" ]; then
+		netmode_lock_wait || return 1
+		rollback_pending "$id" "$previous" "$previous_managed"
+	fi
+}
+
+confirm() {
+	local id deadline lock_rc
+	netmode_lock_acquire
+	lock_rc=$?
+	if [ "$lock_rc" -ne 0 ]; then
+		[ "$lock_rc" -eq 2 ] && printf '%s\n' 'error=another network-mode transaction is running' || printf '%s\n' 'error=network-mode transaction lock unavailable'
+		return 1
+	fi
+	ensure_config || return 1
+	id=$(get sbair.bridge.pending_id)
+	if [ -z "$id" ]; then printf '%s\n' 'result=no_pending'; return 0; fi
+	deadline=$(get sbair.bridge.pending_deadline)
+	case "$deadline" in ''|*[!0-9]*) deadline=0;; esac
+	if [ "$(now)" -ge "$deadline" ]; then
+		if rollback_pending "$id" "$(get sbair.bridge.pending_previous)"; then
+			printf 'result=rolled_back\ntransaction=%s\n' "$id"
+			return 0
+		fi
+		printf '%s\n' 'error=rollback failed'
+		return 1
+	fi
+	clear_pending || { printf '%s\n' 'error=unable to clear confirmed transaction'; return 1; }
+	write_state "$id" confirmed 'configuration confirmed'
+	rm -f "$(pid_file_for "$id")"
+	printf 'result=confirmed\ntransaction=%s\n' "$id"
+}
+
+rollback() {
+	local id previous lock_rc
+	netmode_lock_acquire
+	lock_rc=$?
+	if [ "$lock_rc" -ne 0 ]; then
+		[ "$lock_rc" -eq 2 ] && printf '%s\n' 'error=another network-mode transaction is running' || printf '%s\n' 'error=network-mode transaction lock unavailable'
+		return 1
+	fi
+	ensure_config || return 1
+	id=$(get sbair.bridge.pending_id)
+	if [ -n "$id" ]; then
+		previous=$(get sbair.bridge.pending_previous)
+		rollback_pending "$id" "$previous" || { printf '%s\n' 'error=rollback failed'; return 1; }
+		printf 'result=rolled_back\ntransaction=%s\n' "$id"
+		return 0
+	fi
+	printf '%s\n' 'result=no_pending'
+}
+
+unmanage() {
+	local pending lock_rc
+	netmode_lock_acquire
+	lock_rc=$?
+	if [ "$lock_rc" -ne 0 ]; then
+		[ "$lock_rc" -eq 2 ] && printf '%s\n' 'error=another network-mode transaction is running' || printf '%s\n' 'error=network-mode transaction lock unavailable'
+		return 1
+	fi
+	ensure_config || return 1
+	pending=$(get sbair.bridge.pending_id)
+	[ -z "$pending" ] || { printf '%s\n' 'error=another mode change is awaiting confirmation'; return 1; }
+	if [ "$(get sbair.bridge.managed)" != 1 ]; then
+		clear_draft
+		clear_sim_profile
+		for key in dhcp_start dhcp_limit dhcp_leasetime; do del_opt "sbair.bridge.$key"; done
+		commit sbair
+		printf '%s\n' 'result=already_unmanaged' 'mode=unmanaged'
+		return 0
+	fi
+	if fallback_active; then
+		printf '%s\n' 'error=管理解除の前にFallbackではない管理IPを確立してください'
+		return 1
+	fi
+	# Management release changes ownership metadata and package runtime guards
+	# only. The current network, DHCP, WAN, and Wi-Fi configuration is retained.
+	set_opt sbair.bridge.managed 0
+	clear_draft
+	clear_sim_profile
+	for key in dhcp_start dhcp_limit dhcp_leasetime; do del_opt "sbair.bridge.$key"; done
+	commit sbair || { printf '%s\n' 'error=unable to release sbair management'; return 1; }
+	dhcp_guard_disable || true
+	rm -f "$DHCP_START_FILE" "$CONFLICT_FILE" "$FALLBACK_FILE"
+	/etc/init.d/sbair-netfix stop >/dev/null 2>&1 || true
+	printf '%s\n' 'result=unmanaged' 'mode=unmanaged' 'network=unchanged'
+}
+
+recover() {
+	local id lock_rc address
+	netmode_lock_acquire
+	lock_rc=$?
+	if [ "$lock_rc" -ne 0 ]; then
+		[ "$lock_rc" -eq 2 ] && printf '%s\n' 'error=another network-mode transaction is running' || printf '%s\n' 'error=network-mode transaction lock unavailable'
+		return 1
+	fi
+	ensure_config || return 1
+	id=$(get sbair.bridge.pending_id)
+	[ -z "$id" ] || clear_pending
+	apply_sim_config 1 || { printf '%s\n' 'error=recovery failed'; return 1; }
+	/etc/init.d/sbair-netfix stop >/dev/null 2>&1 || true
+	# Report the address selected by the recovery transaction, not a hard-coded
+	# value. Force-recovery normally selects the documented factory address, while
+	# an existing valid SIM profile may restore a different local address.
+	address=$(get network.lan.ipaddr)
+	if [ -z "$address" ]; then
+		address=$(ip -4 -o addr show dev "$BRIDGE" 2>/dev/null | awk -v a="$VENDOR_ALIAS" '$3 == "inet" {split($4,p,"/"); if (p[1] != a) {print p[1]; exit}}')
+	fi
+	[ -n "$address" ] || address=unknown
+	printf 'result=recovered\nmode=sim\naddress=%s\ndhcp=on\n' "$address"
+}
+
+show_config() {
+	local draft oem_ready
+	ensure_config
+	draft=$(get sbair.bridge.draft_ready)
+	load_saved_config
+	static_resolution_reset
+	if [ "$config_proto" = static ]; then
+		resolve_static_config "$config_ipaddr" "$config_netmask" "$config_gateway" "$config_dns" || true
+	fi
+	oem_ready=$(get sbair.bridge.oem_baseline_ready)
+	printf 'mode=%s\nconfigured_mode=%s\nmanaged=%s\nproto=%s\nipaddr=%s\nnetmask=%s\ngateway=%s\ndns=%s\nfallback_enabled=%s\nfallback_ip=%s\nfallback_netmask=%s\nfallback_timeout=%s\n' \
+		"$([ "$(get sbair.bridge.managed)" = 1 ] && printf '%s' "$(get sbair.bridge.mode)" || printf unmanaged)" "$(get sbair.bridge.mode)" "$(get sbair.bridge.managed)" "$config_proto" "$config_ipaddr" "$config_netmask" \
+		"$config_gateway" "$config_dns" "$config_enabled" "$config_fallback" \
+		"$config_fallback_mask" "$config_timeout"
+	printf 'oem_baseline_ready=%s\noem.ipaddr=%s\noem.netmask=%s\noem.gateway=%s\noem.dns=%s\n' \
+		"$oem_ready" "$(get sbair.bridge.oem_ipaddr)" "$(get sbair.bridge.oem_netmask)" \
+		"$(get sbair.bridge.oem_gateway)" "$(get sbair.bridge.oem_dns)"
+	printf 'effective.ipaddr=%s\neffective.netmask=%s\neffective.gateway=%s\neffective.dns=%s\neffective.ipaddr_source=%s\neffective.netmask_source=%s\neffective.gateway_source=%s\neffective.dns_source=%s\neffective.error=%s\n' \
+		"$static_effective_ipaddr" "$static_effective_netmask" "$static_effective_gateway" "$static_effective_dns" \
+		"$static_effective_ipaddr_source" "$static_effective_netmask_source" "$static_effective_gateway_source" "$static_effective_dns_source" "$static_resolve_error"
+	printf 'ap_dhcp_enabled=%s\n' "$(if ap_dhcp_allowed; then printf 1; else printf 0; fi)"
+	printf 'dhcp.start=%s\ndhcp.limit=%s\ndhcp.leasetime=%s\ndhcp.network=%s\ndhcp.netmask=%s\ndesired_dhcp.start=%s\ndesired_dhcp.limit=%s\ndesired_dhcp.leasetime=%s\n' \
+		"$(get dhcp.lan.start)" "$(get dhcp.lan.limit)" "$(get dhcp.lan.leasetime)" \
+		"$([ "$(get network.lan.proto)" = static ] && get network.lan.ipaddr || true)" \
+		"$([ "$(get network.lan.proto)" = static ] && get network.lan.netmask || true)" \
+		"$config_dhcp_start" "$config_dhcp_limit" "$config_dhcp_leasetime"
+	printf 'draft=%s\n' "$([ "$draft" = 1 ] && printf 1 || printf 0)"
+}
+
+parse_config_args() {
+	load_saved_config
+	for config_arg in "$@"; do
+		case "$config_arg" in
+			proto=*) config_proto=${config_arg#*=};;
+			ipaddr=*) config_ipaddr=${config_arg#*=};;
+			netmask=*) config_netmask=${config_arg#*=};;
+			gateway=*) config_gateway=${config_arg#*=};;
+			dns=*) config_dns=${config_arg#*=};;
+			fallback_enabled=*) config_enabled=${config_arg#*=};;
+			fallback_ip=*) config_fallback=${config_arg#*=};;
+			fallback_netmask=*) config_fallback_mask=${config_arg#*=};;
+			fallback_timeout=*) config_timeout=${config_arg#*=};;
+			dhcp_start=*) config_dhcp_start=${config_arg#*=};;
+			dhcp_limit=*) config_dhcp_limit=${config_arg#*=};;
+			dhcp_leasetime=*) config_dhcp_leasetime=${config_arg#*=};;
+		esac
+	done
+}
+
+validate_config_args() {
+	local lease_number
+	[ "$config_proto" = dhcp ] || [ "$config_proto" = static ] || { printf '%s\n' 'error=invalid management protocol'; return 1; }
+	if [ "$config_proto" = static ]; then
+		[ -z "$config_ipaddr" ] || is_ipv4 "$config_ipaddr" || { printf '%s\n' 'error=invalid static address'; return 1; }
+		[ -z "$config_netmask" ] || mask_to_prefix "$config_netmask" >/dev/null || { printf '%s\n' 'error=invalid static netmask'; return 1; }
+	fi
+	[ -z "$config_gateway" ] || is_ipv4 "$config_gateway" || { printf '%s\n' 'error=invalid gateway'; return 1; }
+	is_ipv4 "$config_fallback" || { printf '%s\n' 'error=invalid fallback address'; return 1; }
+	[ "$config_fallback" != "$VENDOR_ALIAS" ] || { printf '%s\n' 'error=fallback conflicts with vendor alias'; return 1; }
+	mask_to_prefix "$config_fallback_mask" >/dev/null || { printf '%s\n' 'error=invalid fallback netmask'; return 1; }
+	case "$config_enabled" in 0|1) ;; *) printf '%s\n' 'error=fallback_enabled must be 0 or 1'; return 1;; esac
+	case "$config_timeout" in ''|*[!0-9]*) printf '%s\n' 'error=invalid fallback timeout'; return 1;; esac
+	[ "$config_timeout" -ge 5 ] && [ "$config_timeout" -le 3600 ] || { printf '%s\n' 'error=fallback timeout must be 5..3600'; return 1; }
+	if [ -n "$config_dhcp_start" ] || [ -n "$config_dhcp_limit" ]; then
+		case "$config_dhcp_start" in ''|*[!0-9]*) printf '%s\n' 'error=invalid DHCP pool start'; return 1;; esac
+		case "$config_dhcp_limit" in ''|*[!0-9]*) printf '%s\n' 'error=invalid DHCP pool limit'; return 1;; esac
+		[ "$config_dhcp_start" -gt 0 ] || { printf '%s\n' 'error=DHCP pool start must be positive'; return 1; }
+		[ "$config_dhcp_limit" -gt 0 ] || { printf '%s\n' 'error=DHCP pool limit must be positive'; return 1; }
+	fi
+	case "$config_dhcp_leasetime" in
+		'') ;;
+		infinite) ;;
+		*[!0-9smhdw]*) printf '%s\n' 'error=invalid DHCP lease time'; return 1;;
+		*) :;;
+	esac
+	case "$config_dhcp_leasetime" in
+		*[smhdw]) lease_number=${config_dhcp_leasetime%?};;
+		[0-9]*) lease_number=$config_dhcp_leasetime;;
+		*) lease_number=0;;
+	esac
+	[ -z "$config_dhcp_leasetime" ] || [ "$config_dhcp_leasetime" = infinite ] || [ "${lease_number:-0}" -gt 0 ] || {
+		printf '%s\n' 'error=DHCP lease time must be positive'; return 1;
+	}
+}
+
+write_config_args() {
+	set_opt sbair.bridge.management_proto "$config_proto" || return 1
+	set_opt sbair.bridge.ipaddr "$config_ipaddr" || return 1
+	set_opt sbair.bridge.netmask "$config_netmask" || return 1
+	set_opt sbair.bridge.gateway "$config_gateway" || return 1
+	set_opt sbair.bridge.dns "$config_dns" || return 1
+	set_opt sbair.bridge.fallback_enabled "$config_enabled" || return 1
+	set_opt sbair.bridge.fallback_ip "$config_fallback" || return 1
+	set_opt sbair.bridge.fallback_netmask "$config_fallback_mask" || return 1
+	set_opt sbair.bridge.fallback_timeout "$config_timeout" || return 1
+	if [ -n "$config_dhcp_start" ]; then set_opt sbair.bridge.dhcp_start "$config_dhcp_start" || return 1; else snapshot_delete sbair.bridge.dhcp_start || return 1; fi
+	if [ -n "$config_dhcp_limit" ]; then set_opt sbair.bridge.dhcp_limit "$config_dhcp_limit" || return 1; else snapshot_delete sbair.bridge.dhcp_limit || return 1; fi
+	if [ -n "$config_dhcp_leasetime" ]; then set_opt sbair.bridge.dhcp_leasetime "$config_dhcp_leasetime" || return 1; else snapshot_delete sbair.bridge.dhcp_leasetime || return 1; fi
+}
+
+write_draft_args() {
+	set_opt sbair.bridge.draft_proto "$config_proto"
+	set_opt sbair.bridge.draft_ipaddr "$config_ipaddr"
+	set_opt sbair.bridge.draft_netmask "$config_netmask"
+	set_opt sbair.bridge.draft_gateway "$config_gateway"
+	set_opt sbair.bridge.draft_dns "$config_dns"
+	set_opt sbair.bridge.draft_fallback_enabled "$config_enabled"
+	set_opt sbair.bridge.draft_fallback_ip "$config_fallback"
+	set_opt sbair.bridge.draft_fallback_netmask "$config_fallback_mask"
+	set_opt sbair.bridge.draft_fallback_timeout "$config_timeout"
+	set_opt sbair.bridge.draft_dhcp_start "$config_dhcp_start"
+	set_opt sbair.bridge.draft_dhcp_limit "$config_dhcp_limit"
+	set_opt sbair.bridge.draft_dhcp_leasetime "$config_dhcp_leasetime"
+	set_opt sbair.bridge.draft_ready 1
+}
+
+set_config() {
+	local pending lock_rc
+	netmode_lock_acquire
+	lock_rc=$?
+	[ "$lock_rc" -eq 0 ] || { printf '%s\n' 'error=network-mode transaction lock unavailable'; return 1; }
+	ensure_config || return 1
+	pending=$(get sbair.bridge.pending_id)
+	[ -z "$pending" ] || { printf '%s\n' 'error=another mode change is awaiting confirmation'; return 1; }
+	parse_config_args "$@"
+	validate_config_args || return 1
+	if [ "$config_proto" = static ]; then
+		resolve_static_config "$config_ipaddr" "$config_netmask" "$config_gateway" "$config_dns" || {
+			printf '%s\n' "error=$static_resolve_error"
+			return 1
+		}
+	fi
+	if [ "$(get sbair.bridge.mode)" = ap ] && [ "$(get sbair.bridge.managed)" = 1 ]; then
+		validate_ap_proto ap "$config_proto" || return 1
+	fi
+	# Deprecated compatibility API: keep edits in a draft so it cannot bypass
+	# Safe Apply. Active sbair.bridge.* changes only inside start_apply.
+	write_draft_args
+	commit sbair || { printf '%s\n' 'error=unable to save configuration draft'; return 1; }
+	printf '%s\n' 'result=ok' 'draft=1' 'deprecated=1'
+}
+
+show_status() {
+	local mode configured_mode managed proto address fallback_active_value fallback_conflict_value configured udp67 guard route members member_count health warnings repair_count repair_last pending_id pending_mode deadline remaining cellular_iface bridge_up_value
+	ensure_config
+	static_resolution_reset
+	warnings=
+	configured_mode=$(get sbair.bridge.mode)
+	[ "$configured_mode" = ap ] || configured_mode=sim
+	managed=$(get sbair.bridge.managed)
+	[ "$managed" = 1 ] || managed=0
+	mode=$configured_mode
+	[ "$managed" = 1 ] || mode=unmanaged
+	proto=$(get sbair.bridge.management_proto)
+	[ "$proto" = dhcp ] || proto=static
+	if [ "$configured_mode" = ap ] && [ "$proto" = static ]; then
+		resolve_static_config "$(get sbair.bridge.ipaddr)" "$(get sbair.bridge.netmask)" \
+			"$(get sbair.bridge.gateway)" "$(get sbair.bridge.dns)" || true
+	fi
+	if [ "$configured_mode" = ap ] && [ "$proto" = dhcp ]; then address=$(dhcp_address); else address=$(get network.lan.ipaddr); fi
+	fallback_active_value=0
+	fallback_active && fallback_active_value=1
+	[ -n "$address" ] || [ "$fallback_active_value" -eq 0 ] || address=$(get sbair.bridge.fallback_ip)
+	fallback_conflict_value=0
+	[ -f "$CONFLICT_FILE" ] && fallback_conflict_value=1
+	configured=0
+	[ "$(get dhcp.lan.ignore)" = 1 ] || configured=1
+	udp67=0
+	udp67_listening && udp67=1
+	guard=0
+	dhcp_guard_present && guard=1
+	route=0
+	cellular_default_route && route=1
+	members=$(bridge_members)
+	member_count=0
+	[ -z "$members" ] || member_count=$(printf '%s\n' "$members" | awk '{print NF}')
+	health=ok
+	if [ "$managed" -eq 0 ]; then
+		health=unmanaged
+		add_warning '未管理（既存設定）: AP / BridgeまたはSIMルーターを明示的に適用するまで既存設定を変更しません'
+	elif [ "$configured_mode" = ap ]; then
+		[ "$proto" != static ] || [ -z "$static_resolve_error" ] || { add_warning "$static_resolve_error"; health=warn; }
+		if [ "$proto" = dhcp ] && ! ap_dhcp_allowed; then
+			add_warning 'APモードのDHCPクライアントは安全フラグで無効化されています。非常に高リスクなため、固定IPへ移行するか、UART復旧手段を確保したうえで明示的に再有効化してください'
+			health=warn
+		fi
+		[ "$configured" -eq 0 ] || { add_warning 'DHCP設定が停止状態ではありません'; health=danger; }
+		if [ "$udp67" -ne 0 ]; then
+			if [ "$guard" -eq 1 ]; then
+				add_warning 'システム上のUDP/67は待機中ですが、br-lan向け応答はguardで遮断しています'
+			else
+				add_warning 'UDP/67でDHCPサーバーが待機中で、br-lan向けguardも確認できません'; health=danger
+			fi
+		fi
+		[ "$managed" -eq 0 ] || [ "$guard" -eq 1 ] || { add_warning 'DHCP packet guardが有効ではありません'; health=danger; }
+		[ "$(get network.lan.proto)" = "$proto" ] || { add_warning '管理IP方式とnetwork.lanが不一致です'; health=warn; }
+		[ "$(get network.wan.disabled)" = 1 ] || { add_warning 'Cellular WANが無効化されていません'; health=danger; }
+		[ "$route" -eq 0 ] || { add_warning 'Cellular側にデフォルトルートがあります'; health=danger; }
+		bridge_up || { add_warning 'br-lanが停止しています'; health=danger; }
+		[ "$member_count" -gt 0 ] || { add_warning 'br-lanのメンバーを確認できません'; health=warn; }
+		[ "$fallback_conflict_value" -eq 0 ] || { add_warning 'Fallback IPを安全に付与できません（競合またはARP probe未使用）'; health=warn; }
+		if [ -z "$address" ] && [ "$fallback_active_value" -eq 0 ]; then
+			local start timeout elapsed
+			start=$(cat "$DHCP_START_FILE" 2>/dev/null || now)
+			timeout=$(get sbair.bridge.fallback_timeout)
+			case "$timeout" in ''|*[!0-9]*) timeout=15;; esac
+			elapsed=$(( $(now) - start ))
+			if [ "$elapsed" -ge "$timeout" ] || [ "$proto" = static ]; then
+				add_warning '管理IPを取得できていません'; health=warn
+			fi
+		fi
+	else
+		[ "$(get dhcp.lan.ignore)" = 1 ] && { add_warning 'SIMルーターモードなのにDHCPが停止しています'; health=danger; }
+		[ "$guard" -eq 0 ] || { add_warning 'SIMルーターモードなのにDHCP packet guardが残っています'; health=danger; }
+	fi
+	cellular_iface=$(get network.wan.device)
+	[ "$(get network.wan.proto)" = ql_datacall ] || cellular_iface=
+	bridge_up_value=0
+	bridge_up && bridge_up_value=1
+	repair_count=0
+	repair_last=-
+	[ -f "$REPAIR_FILE" ] && repair_count=$(sed -n 's/^count=//p' "$REPAIR_FILE" 2>/dev/null)
+	[ -f "$REPAIR_FILE" ] && repair_last=$(sed -n 's/^last=//p' "$REPAIR_FILE" 2>/dev/null)
+	pending_id=$(get sbair.bridge.pending_id)
+	pending_mode=$(get sbair.bridge.pending_mode)
+	deadline=$(get sbair.bridge.pending_deadline)
+	remaining=0
+	case "$deadline" in ''|*[!0-9]*) ;; *) remaining=$((deadline - $(now))); [ "$remaining" -gt 0 ] || remaining=0;; esac
+	printf 'mode=%s\nconfigured_mode=%s\nmanaged=%s\nhealthy=%s\nhealth=%s\nmanagement.proto=%s\nmanagement.address=%s\nmanagement.gateway=%s\nmanagement.dns=%s\nmanagement.oem_baseline_ready=%s\nmanagement.oem.ipaddr=%s\nmanagement.oem.netmask=%s\nmanagement.oem.gateway=%s\nmanagement.oem.dns=%s\nmanagement.effective.ipaddr=%s\nmanagement.effective.netmask=%s\nmanagement.effective.gateway=%s\nmanagement.effective.dns=%s\nmanagement.effective.ipaddr_source=%s\nmanagement.effective.netmask_source=%s\nmanagement.effective.gateway_source=%s\nmanagement.effective.dns_source=%s\nmanagement.fallback_ip=%s\nmanagement.fallback_netmask=%s\nmanagement.fallback_active=%s\nmanagement.fallback_conflict=%s\ndhcp.configured=%s\ndhcp.udp67_listening=%s\ndhcp.udp67_scope=%s\ndhcp.uci_ignore=%s\ndhcp.guard_active=%s\nbridge.device=%s\nbridge.up=%s\nbridge.members=%s\nbridge.members_count=%s\ncellular.interface=%s\ncellular.routing_enabled=%s\ncellular.default_route=%s\nwifi.mlo=%s\nwifi.bandsteering=%s\nwifi.2g=%s\nwifi.5g=%s\nwifi.6g=%s\nrepair.last=%s\nrepair.count=%s\npending.id=%s\npending.mode=%s\npending.remaining=%s\nwarnings=%s\n' \
+		"$mode" "$configured_mode" "$managed" "$([ "$health" = ok ] && printf 1 || printf 0)" "$health" "$proto" "$address" "$(default_gateway)" "$(dns_server)" \
+		"$(get sbair.bridge.oem_baseline_ready)" "$(get sbair.bridge.oem_ipaddr)" "$(get sbair.bridge.oem_netmask)" "$(get sbair.bridge.oem_gateway)" "$(get sbair.bridge.oem_dns)" \
+		"$static_effective_ipaddr" "$static_effective_netmask" "$static_effective_gateway" "$static_effective_dns" "$static_effective_ipaddr_source" "$static_effective_netmask_source" "$static_effective_gateway_source" "$static_effective_dns_source" \
+		"$(get sbair.bridge.fallback_ip)" "$(get sbair.bridge.fallback_netmask)" \
+		"$fallback_active_value" "$fallback_conflict_value" "$configured" "$udp67" system "$([ "$(get dhcp.lan.ignore)" = 1 ] && printf 1 || printf 0)" "$guard" \
+		"$BRIDGE" "$bridge_up_value" "$members" "$member_count" \
+		"$cellular_iface" "$route" "$route" "$(wifi_mlo)" "$(get knos.network.bandsteering)" "$(wifi_band ra0 2.4G)" "$(wifi_band rai0 5G)" "$(wifi_band rax0 6G)" \
+		"$repair_last" "$repair_count" "$pending_id" "$pending_mode" "$remaining" "$warnings"
+}
+
+show_version() {
+	printf 'implementation=%s\nschema=%s\nversion=%s\n' \
+		"$NETMODE_IMPLEMENTATION" "$NETMODE_SCHEMA" "$NETMODE_VERSION"
+}
+
+startup() {
+	local id deadline remaining previous_managed lock_rc
+	netmode_lock_acquire
+	lock_rc=$?
+	[ "$lock_rc" -eq 0 ] || return 1
+	ensure_config || return 1
+	id=$(get sbair.bridge.pending_id)
+	if [ -n "$id" ]; then
+		deadline=$(get sbair.bridge.pending_deadline)
+		case "$deadline" in ''|*[!0-9]*) deadline=0;; esac
+		if [ "$(now)" -ge "$deadline" ]; then
+			rollback_pending "$id" "$(get sbair.bridge.pending_previous)" "$(get sbair.bridge.pending_previous_managed)" || true
+		else
+			remaining=$((deadline - $(now)))
+			previous_managed=$(get sbair.bridge.pending_previous_managed)
+			start_rollback_watch "$id" "$deadline" "$(get sbair.bridge.pending_previous)" "$previous_managed"
+		fi
+	fi
+	if [ -z "$(get sbair.bridge.pending_id)" ] &&
+		[ "$(get sbair.bridge.mode)" = ap ] &&
+		[ "$(get sbair.bridge.managed)" = 1 ] &&
+		[ "$(get sbair.bridge.management_proto)" = dhcp ] &&
+		! ap_dhcp_allowed; then
+		# Migrate legacy AP-DHCP state once the transaction path is settled. The
+		# repair path applies the static LAN, keeps Wi-Fi untouched, and verifies
+		# the DHCP guard just like an explicit AP apply.
+		if prepare_ap_static_config; then
+			repair_config >/dev/null 2>&1 || true
+		fi
+	fi
+	[ "$(get sbair.bridge.mode)" = ap ] && [ "$(get sbair.bridge.managed)" = 1 ] || return 0
+	# Re-apply the same resolved static values used by Safe Apply. This keeps
+	# startup repair from treating a blank raw field as an empty network value.
+	repair_config >/dev/null 2>&1 || true
+	# The UCI include covers later firewall reloads; run it now to close the
+	# boot window before the 15-second repair service's first iteration.
+	[ -x /usr/share/sbair/firewall.include ] && /usr/share/sbair/firewall.include >/dev/null 2>&1 || true
+	dhcp_guard_enable || true
+	[ -f "$DHCP_START_FILE" ] || safe_runtime_write "$DHCP_START_FILE" "$(date +%s)" || return 1
+}
+
+case "${1:-}" in
+	version) show_version;;
+	show) ensure_config; show_status;;
+	get-config) show_config;;
+	pool-context) ensure_config; pool_context "${2:-}";;
+	set-config) shift; set_config "$@";;
+	apply) shift; start_apply "$@";;
+	# Compatibility for pre-Safe-Apply callers. These aliases deliberately use
+	# the same transaction path as `apply`; they must never mutate immediately.
+	sim|ap) start_apply "$1";;
+	confirm) confirm;;
+	rollback) rollback;;
+	unmanage) unmanage;;
+	recover) recover;;
+	repair) repair_config;;
+	dhcp-event)
+		shift
+		netmode_lock_wait || exit 0
+		ensure_config || exit 0
+		logical=${INTERFACE:-}
+		physical=${interface:-${IFACE:-}}
+		action=
+		case "${ACTION:-}" in bound|renew) action=$ACTION;; esac
+		# OpenWrt 21.02 commonly supplies <action> first, while vendor wrappers
+		# use <logical> <physical> <action>. Scan all positions and let ACTION
+		# win when it is exported; this keeps the hook independent of that layout.
+		for dhcp_arg in "${1:-}" "${2:-}" "${3:-}"; do
+			case "$dhcp_arg" in
+				lan) [ -n "$logical" ] || logical=$dhcp_arg;;
+				br-lan) [ -n "$physical" ] || physical=$dhcp_arg;;
+				bound|renew) [ -n "$action" ] || action=$dhcp_arg;;
+			esac
+		done
+		# Accept both netifd's logical name and udhcpc's physical device. An
+		# event from WAN/wan1 or an unknown device must be a true no-op.
+		[ "$logical" = lan ] || [ "$physical" = br-lan ] || [ "${1:-}" = br-lan ] || exit 0
+		case "$action" in
+			bound|renew)
+				if [ "$(get sbair.bridge.mode)" = ap ] && [ "$(get sbair.bridge.managed)" = 1 ]; then
+					fallback_remove
+					rm -f "$DHCP_START_FILE" "$CONFLICT_FILE"
+				fi
+				;;
+		esac
+		;;
+	startup) startup;;
+	--apply-worker) apply_worker "${2:-}" "${3:-}" "${4:-sim}" "${5:-0}";;
+	--rollback-watch) rollback_watch "${2:-}" "${3:-0}" "${4:-sim}" "${5:-0}";;
+	*)
+		printf '%s\n' 'usage: sbair-netmode version|show|get-config|pool-context sim|set-config|apply sim|apply ap|sim|ap|confirm|rollback|unmanage|recover|repair' >&2
+		exit 2
+		;;
+esac

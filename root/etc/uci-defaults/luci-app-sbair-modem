@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Register the package-owned firewall include once on first boot.
+
+uci -q get firewall.sbair_dhcp_guard >/dev/null 2>&1 || \
+	uci -q set firewall.sbair_dhcp_guard=include
+uci -q set firewall.sbair_dhcp_guard.type=script
+uci -q set firewall.sbair_dhcp_guard.path=/usr/share/sbair/firewall.include
+uci -q set firewall.sbair_dhcp_guard.reload=1
+uci -q commit firewall
+rm -f "$0"

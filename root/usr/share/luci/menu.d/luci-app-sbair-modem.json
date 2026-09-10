@@ -10,8 +10,16 @@
 		}
 	},
 
-	"admin/sbair/signal": {
-		"title": "電波状況",
+	"admin/sbair/mobile": {
+		"title": "モバイル回線",
+		"order": 10,
+		"action": {
+			"type": "firstchild"
+		}
+	},
+
+	"admin/sbair/mobile/status": {
+		"title": "状態",
 		"order": 10,
 		"action": {
 			"type": "view",
@@ -19,8 +27,8 @@
 		}
 	},
 
-	"admin/sbair/sim": {
-		"title": "SIM",
+	"admin/sbair/mobile/sim": {
+		"title": "SIM / eSIM",
 		"order": 20,
 		"action": {
 			"type": "view",
@@ -28,66 +36,126 @@
 		}
 	},
 
-	"admin/sbair/sms": {
+	"admin/sbair/mobile/sms": {
 		"title": "SMS",
-		"order": 25,
+		"order": 30,
 		"action": {
 			"type": "view",
 			"path": "sbair/sms"
 		}
 	},
 
-	"admin/sbair/device": {
-		"title": "デバイス情報",
-		"order": 30,
+	"admin/sbair/wifi": {
+		"title": "Wi-Fi",
+		"order": 20,
 		"action": {
-			"type": "view",
-			"path": "sbair/device"
+			"type": "firstchild"
 		}
 	},
 
-	"admin/sbair/wifi": {
-		"title": "Wi-Fi",
-		"order": 35,
+	"admin/sbair/wifi/basic": {
+		"title": "基本設定",
+		"order": 10,
 		"action": {
 			"type": "view",
 			"path": "sbair/wifi"
 		}
 	},
 
-	"admin/sbair/clients": {
-		"title": "接続機器",
-		"order": 37,
-		"action": {
-			"type": "view",
-			"path": "sbair/clients"
-		}
-	},
-
-	"admin/sbair/wifi_advanced": {
-		"title": "Wi-Fi詳細設定",
-		"order": 36,
+	"admin/sbair/wifi/advanced": {
+		"title": "詳細設定",
+		"order": 20,
 		"action": {
 			"type": "view",
 			"path": "sbair/wifi_advanced"
 		}
 	},
 
-	"admin/sbair/netmode": {
+	"admin/sbair/wifi/diagnostics": {
+		"title": "診断",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "sbair/wifi_drift"
+		}
+	},
+
+	"admin/sbair/clients": {
+		"title": "接続機器",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "sbair/clients"
+		}
+	},
+
+	"admin/sbair/network": {
+		"title": "ネットワーク",
+		"order": 40,
+		"action": {
+			"type": "firstchild"
+		}
+	},
+
+	"admin/sbair/network/netmode": {
 		"title": "接続モード",
-		"order": 38,
+		"order": 10,
 		"action": {
 			"type": "view",
 			"path": "sbair/netmode"
 		}
 	},
 
-	"admin/sbair/adblock": {
-		"title": "広告ブロック",
-		"order": 39,
+	"admin/sbair/network/lan-services": {
+		"title": "LANサービス",
+		"order": 20,
 		"action": {
 			"type": "view",
-			"path": "sbair/adblock"
+			"path": "sbair/lan_services"
+		}
+	},
+
+	"admin/sbair/network/diagnostics": {
+		"title": "診断",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "sbair/network_diagnostics"
+		}
+	},
+
+	"admin/sbair/device": {
+		"title": "本体",
+		"order": 50,
+		"action": {
+			"type": "firstchild"
+		}
+	},
+
+	"admin/sbair/device/info": {
+		"title": "本体情報",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "sbair/device"
+		}
+	},
+
+	"admin/sbair/device/usb": {
+		"title": "USB機器",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "sbair/usb"
+		}
+	},
+
+	"admin/sbair/device/update": {
+		"title": "アップデート管理",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "sbair/update"
 		}
 	}
 }

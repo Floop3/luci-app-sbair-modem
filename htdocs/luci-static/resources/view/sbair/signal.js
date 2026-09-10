@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 soralis0912
 //
-// 電波状況。ubus の sbair.overview 1 本だけを叩く。
+// モバイル回線 > 状態。ubus の sbair.overview 1 本だけを叩く。
 
 'use strict';
 'require view';
@@ -18,6 +18,11 @@ var callImsStatus   = rpc.declare({ object: 'sbair', method: 'ims_status' });
 var callImsSet      = rpc.declare({ object: 'sbair', method: 'ims_set', params: [ 'on' ] });
 var callBandSet     = rpc.declare({ object: 'sbair', method: 'band_set', params: [ 'lte', 'nr' ] });
 var callBandStatus  = rpc.declare({ object: 'sbair', method: 'band_status' });
+
+function subsection(title, children) {
+	return E('div', { 'class': 'sbair-subsection' },
+		[ E('h4', {}, title) ].concat(children));
+}
 
 // IMS。**出荷状態ではモデム側で無効。** SMS は IMS 経由で配送されるので、
 // 未登録だと 1 通も届かない。
@@ -72,7 +77,7 @@ function imsSection(self) {
 		'登録と SMS over IMS は残ることがあります。'
 	]));
 
-	return sbair.section('IMS', children);
+	return subsection('IMS', children);
 }
 
 function sameSet(a, b) {
@@ -131,7 +136,7 @@ function bandTiles(self, kind, prefix, supported, enabled, serving, editable) {
 	}));
 }
 
-// バンド。**どの AT で取れるかは機体依存**で、その調べ方は sbair6-rs 側。
+// バンド。**どの AT で取れるかは機体依存**なので、対象機体で確認すること。
 // ここは band.go が返した値を並べるだけ。
 function bandSection(self) {
 	var b = (self.data || {}).band;
@@ -259,7 +264,7 @@ function bandSection(self) {
 			'いまは 5G 側の測定値が空なので、まだ足されていません。'));
 
 	children.push(E('div', { 'class': 'cbi-value-description' }, note));
-	return sbair.section('バンド', children);
+	return subsection('バンド', children);
 }
 
 function resetSection(self) {
@@ -294,20 +299,19 @@ function resetSection(self) {
 		' APN が正しいのに繋がらないときはこれで抜けられます。'
 	]));
 
-	return sbair.section('モデムのリセット', children);
+	return children;
 }
 
-// 画面のいちばん上。**数字より先に「どのくらい入っているか」**が分かる形。
+// 回線概要の先頭。**数字より先に「どのくらい入っているか」**が分かる形。
 // 基準は RSRP、無ければ RSSI。**割合はバッジの中だけ** — 外にも出すと二重になる。
 //
-// **識別子のチェックボックスより上に置く。** ここだけ別の器に描くのは、
-// チェックボックスを更新のたびに作り直さないため。
+// 識別子のチェックボックスとは別に再描画する必要はないため、回線概要へまとめる。
 function statusRow(self) {
 	var data = self.data || {};
 	var dbm = data.rsrp_dbm || data.rssi_dbm || null;
-	// 余白の付け方は sbair.section と揃える。**下のチェックボックスと
-	// くっつかないように。**
-	return E('div', { 'class': 'cbi-section sbair-section' },
+	// 余白の付け方は sbair.section と揃える。概要の情報と登録表を
+	// 同じセクション内で視認できるようにする。
+	return E('div', { 'style': 'margin-bottom:1em' },
 		E('div', { 'style': 'display:flex;align-items:center;gap:1em;flex-wrap:wrap' }, [
 			sbair.signalBadge(dbm, data.rsrp_dbm ? 'RSRP' : (data.rssi_dbm ? 'RSSI' : '')),
 			E('span', {}, data.registered
@@ -320,14 +324,17 @@ function render(self) {
 	var data = self.data || {};
 	var body = [];
 
-	body.push(sbair.section('ネットワーク登録', [ sbair.table([
-		sbair.row('登録状態', data.registration, data.registered ? null : '通信できません'),
-		sbair.row('登録先', data.reg_domain),
-		sbair.row('事業者', data.operator),
-		sbair.row('接続方式', data.access_tech),
-		sbair.row('TAC', data.tac),
-		sbair.row('Cell ID', sbair.mask(data.cell_id))
-	]) ]));
+	body.push(sbair.section('回線概要', [
+		statusRow(self),
+		sbair.table([
+			sbair.row('登録状態', data.registration, data.registered ? null : '通信できません'),
+			sbair.row('登録先', data.reg_domain),
+			sbair.row('事業者', data.operator),
+			sbair.row('接続方式', data.access_tech),
+			sbair.row('TAC', data.tac),
+			sbair.row('Cell ID', sbair.mask(data.cell_id))
+			])
+	]));
 
 	// セル情報系のベンダ拡張は無いので PCI は取りようがない。
 	// +CSQ / +CESQ に加えて、AT+QNWCFG がアンテナごとの値を持っている。
@@ -369,11 +376,13 @@ function render(self) {
 	body.push(sbair.section('電波', signal));
 
 	var bands = bandSection(self);
-	if (bands)
-		body.push(bands);
-
-	body.push(imsSection(self));
-	body.push(resetSection(self));
+	body.push(sbair.section('バンド / IMS', [ bands || '', imsSection(self) ]));
+	body.push(sbair.section('詳細操作', [
+		E('details', {}, [
+			E('summary', {}, 'モデムのリセット'),
+			E('div', {}, resetSection(self))
+		])
+	]));
 	body.push(sbair.errorBox(data.errors));
 	return body;
 }
@@ -398,12 +407,8 @@ return view.extend({
 		var self = this;
 		self.data = data;
 
-		// **状況とその下は別の器にする。** 間にチェックボックスを挟むので、
-		// 1 つにまとめると更新のたびにチェックボックスまで作り直すことになる。
-		var status = E('div', {}, statusRow(self));
 		var container = E('div', {}, render(self));
 		var redraw = function() {
-			dom.content(status, statusRow(self));
 			dom.content(container, render(self));
 		};
 		self.redraw = redraw;
@@ -472,7 +477,6 @@ return view.extend({
 		}, 15);
 
 		return E('div', { 'class': 'cbi-map' }, [
-			status,
 			sbair.revealToggle('識別子 (Cell ID) を表示する', redraw),
 			container,
 			sbair.debugToggle(redraw)
