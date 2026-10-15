@@ -479,14 +479,13 @@ func netdevUSBExpectedDriver(vidpid string) string {
 
 func netdevUSBDriverPlan(device netdevUSBDevice) netdevUSBDriverManagement {
 	knownEthernet := device.NetworkCandidate && netdevUSBExpectedDriver(device.VIDPID) != "要確認"
-	provenance := "unknown"
+	provenance := "unknown / unverified"
 	if device.Driver == "unbound" {
 		provenance = "not-bound"
-	} else if device.Driver != "" {
-		// There is no app-managed module bundle in this release. A bound module
-		// is therefore treated as vendor/system-owned and never removable.
-		provenance = "vendor/system preinstalled"
 	}
+	// sysfs identifies the bound driver name, not the module's origin. This
+	// read-only path does not verify an app-owned module hash or start hook, so
+	// every bound driver remains unknown / unverified.
 	reason := "USB driver操作は読み取り専用です"
 	if device.NetworkCandidate && knownEthernet {
 		reason = "Air 6向けのkernel-matched driver bundleがありません"

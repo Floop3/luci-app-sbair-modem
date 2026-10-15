@@ -37,6 +37,12 @@ const inventory = {
       interfaces: [{ name: '1-1:1.0', class: '02', subclass: '06', protocol: '00', driver: 'unbound', netdevs: [], block_devices: [], modalias: 'usb:v0BDAp8153' }],
       driver_management: { device_class_allowed: true, provenance: 'not-bound', expected_driver: 'r8152（参照）', bundle_available: false, install_available: false, remove_available: false, reason: 'kernel-matched app bundle未提供' }
     },
+    {
+      name: '1-7', kind: 'USB Ethernet / network candidate', vid_pid: '0bda:8156', manufacturer: 'Realtek', product: 'USB 2.5GbE',
+      bus_speed: '5000', bcd_usb: '0310', device_class: '00', driver: 'r8152', network_candidate: true,
+      interfaces: [{ name: '1-7:1.0', class: '02', subclass: '06', protocol: '00', driver: 'r8152', netdevs: ['eth1'], block_devices: [], modalias: 'usb:v0BDAp8156' }],
+      driver_management: { device_class_allowed: true, provenance: 'unknown / unverified', expected_driver: 'r8152（参照）', bundle_available: false, install_available: false, remove_available: false, reason: 'driver由来を検証できません' }
+    },
     { name: '1-2', kind: 'hub', vid_pid: '2109:2817', bus_speed: '480', product: 'USB2.0 Hub', device_class: '09', network_candidate: false, interfaces: [], driver: 'hub', driver_management: { reason: 'USB Ethernet以外は対象外' } },
     { name: '1-3', kind: 'storage', vid_pid: '0781:5591', bus_speed: '5000', product: 'Flash Disk', device_class: '08', network_candidate: false, interfaces: [{ name: '1-3:1.0', class: '08', subclass: '06', protocol: '50', driver: 'usb-storage', netdevs: [], block_devices: ['sda'], modalias: 'usb:v0781p5591' }], driver: 'usb-storage', driver_management: { reason: 'USB Ethernet以外は対象外' } },
     { name: '1-4', kind: 'serial', vid_pid: '067b:2303', bus_speed: '12', product: 'Serial', device_class: '00', network_candidate: false, interfaces: [{ name: '1-4:1.0', class: 'ff', subclass: '00', protocol: '00', driver: 'pl2303', netdevs: [], block_devices: [], modalias: 'usb:v067Bp2303' }], driver: 'pl2303', driver_management: { reason: 'USB Ethernet以外は対象外' } },
@@ -87,8 +93,9 @@ view.load().then(function(data) {
   const content = rendered.children[1];
   assert(content && content.children.every(node => !Array.isArray(node)), 'render contains nested child array');
   const text = textOf(rendered);
-  for (const value of [ '1-1', '1-2', '1-3', '1-4', '1-5', '1-6', '0bda:8153', '5000 Mbps', 'sda', 'r8152（参照）' ])
+  for (const value of [ '1-1', '1-2', '1-3', '1-4', '1-5', '1-6', '1-7', '0bda:8153', '0bda:8156', '5000 Mbps', 'sda', 'r8152（参照）', 'unknown / unverified', 'not-bound' ])
     assert(text.includes(value), 'missing USB inventory value: ' + value);
+  assert(!text.includes('vendor/system preinstalled'), 'unverified bound driver was classified as vendor/system');
   const buttons = flatten(rendered).filter(node => node.tag === 'button');
   const driverButtons = buttons.filter(button => /インストール|削除/.test(textOf(button)));
   assert.strictEqual(driverButtons.length, inventory.usb_devices.length * 2);
