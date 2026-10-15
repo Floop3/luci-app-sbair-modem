@@ -62,11 +62,13 @@ view.load().then(function(data) {
   assert.deepStrictEqual(calls, [ 'netmode_netdev_status' ]);
   const rendered = view.render(data);
   const text = textOf(rendered);
-  for (const value of [ 'br-lan', 'eth0', 'up / 1', 'mtk_soc_eth', 'USB Host network candidate', '0bda:8153', 'r8152' ])
+  for (const value of [ 'br-lan', 'eth0', 'up / 1', 'mtk_soc_eth', 'USB Host network candidate', '0bda:8153', 'r8152', 'Ethernet link rate / duplex', 'USB bus speed', '2.04 Gbit/s', '2.33 Gbit/s', '421 Mbit/s', '2026-09-21', 'iperf3測定を行いません' ])
     assert(text.includes(value), 'missing network diagnostic value: ' + value);
   assert(!text.includes('xhci-hcd'));
   assert(!text.includes('0781:5591'));
   assert.match(source, /netmode_netdev_status/);
+  assert.match(source, /sbair\.section\('Historical throughput references'/);
+  assert(source.includes("sbair.row('5GHz / 160 MHz client → NAS via Air6', '421 Mbit/s')"));
   assert.doesNotMatch(source, /USB buses \/ root hubs/);
   console.log('network-diagnostics-js-fixture-ok');
 }).catch(function(err) {
