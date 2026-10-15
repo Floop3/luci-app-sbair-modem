@@ -31,7 +31,7 @@ function networkDeviceTable(devices) {
 		E('th', { 'class': 'th' }, 'MAC / MTU'),
 		E('th', { 'class': 'th' }, 'master'),
 		E('th', { 'class': 'th' }, 'driver / bus'),
-		E('th', { 'class': 'th' }, 'link / duplex')
+		E('th', { 'class': 'th' }, 'Ethernet link rate / duplex')
 	]) ];
 	(devices || []).forEach(function(device) {
 		rows.push(E('tr', { 'class': 'tr' }, [
@@ -52,7 +52,7 @@ function usbCandidateTable(devices) {
 		E('th', { 'class': 'th' }, 'USB Host network candidate'),
 		E('th', { 'class': 'th' }, 'VID:PID'),
 		E('th', { 'class': 'th' }, 'driver'),
-		E('th', { 'class': 'th' }, 'bus speed')
+		E('th', { 'class': 'th' }, 'USB bus speed')
 	]) ];
 	(devices || []).filter(function(device) { return device.network_candidate; }).forEach(function(device) {
 		rows.push(E('tr', { 'class': 'tr' }, [
@@ -78,6 +78,17 @@ function render(data) {
 	return [
 		E('p', { 'style': 'opacity:.8' },
 			'sysfsを主に参照する読み取り専用診断です。USB Host Ethernetを自動でWAN/LANへ割り当てず、UCI・bridge・kernel moduleも変更しません。'),
+		E('p', { 'style': 'opacity:.8' },
+			'Ethernet link rate と USB bus speed は報告されたリンク／バス速度であり、アプリケーション実効速度ではありません。この画面ではiperf3測定を行いません。'),
+		sbair.section('Historical throughput references', [
+			E('p', { 'style': 'opacity:.8' },
+				'過去のTCP P1 iperf3実測値（2026-09-21、各10秒）。現在の速度を示すものではありません。Wi-Fi値は5GHz / 160MHz (channel 56)のclient → Air6 → NASの転送です。'),
+			sbair.table([
+				sbair.row('RTL8156 raw LAN — Air6 → NAS', '2.04 Gbit/s'),
+				sbair.row('RTL8156 raw LAN — NAS → Air6', '2.33 Gbit/s'),
+				sbair.row('5GHz / 160 MHz client → NAS via Air6', '421 Mbit/s')
+			])
+		]),
 		sbair.section('Bridge', [ sbair.table([
 			sbair.row('Bridge', valueOrDash(bridge.name)),
 			sbair.row('Bridge members', bridge.members && bridge.members.length ? bridge.members.join(', ') : '未検出')
